@@ -2,44 +2,15 @@
 require_once 'config.php';
 
 if (!isset($_SESSION['user_id']) || !isset($_SESSION['username'])) {
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-        header('Content-Type: application/json');
-        echo json_encode(['status' => 'error', 'message' => 'عدم دسترسی']);
-        exit;
-    }
-    ?>
-    <!DOCTYPE html>
-    <html lang="fa" dir="rtl">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>عدم دسترسی</title>
-        <link rel="icon" type="image/png" href="<?php echo $favicon_path; ?>">
-        <style>
-            body { margin:0; height:100vh; display:flex; justify-content:center; align-items:center; background:#0f172a; color:#fff; font-family:sans-serif; }
-            .error-box { text-align:center; padding:40px; background:#1e293b; border-radius:20px; border:1px solid #ef4444; box-shadow:0 10px 40px rgba(239,68,68,0.2); animation:fadeIn 0.5s ease; max-width:90%; width:400px; }
-            .icon { font-size:60px; margin-bottom:20px; display:block; }
-            h1 { margin:0 0 10px; color:#ef4444; }
-            p { color:#94a3b8; margin-bottom:25px; }
-            .btn { background:#334155; color:#fff; text-decoration:none; padding:10px 25px; border-radius:10px; transition:0.3s; display:inline-block; }
-            .btn:hover { background:#475569; }
-            @keyframes fadeIn { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
-        </style>
-    </head>
-    <body>
-        <div class="error-box">
-            <span class="icon">🚫</span>
-            <h1>دسترسی غیرمجاز</h1>
-            <p>شما مجوز ورود به این بخش را ندارید.</p>
-            <a href="index.php" class="btn">بازگشت به خانه</a>
-        </div>
-    </body>
-    </html>
-    <?php
+    header('Location: admin-login.php');
     exit;
 }
 
-if ($_SESSION['username'] !== $admin_username) {
+$sessionUser = $_SESSION['username'];
+$isMainAdmin = ($sessionUser === $admin_username);
+$isSubAdmin  = (!$isMainAdmin && is_admin_user($sessionUser, $pdo));
+
+if (!$isMainAdmin && !$isSubAdmin) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         header('Content-Type: application/json');
         echo json_encode(['status' => 'error', 'message' => 'شما ادمین نیستید']);
@@ -54,21 +25,19 @@ if ($_SESSION['username'] !== $admin_username) {
         <title>عدم دسترسی</title>
         <link rel="icon" type="image/png" href="<?php echo $favicon_path; ?>">
         <style>
-            body { margin:0; height:100vh; display:flex; justify-content:center; align-items:center; background:#0f172a; color:#fff; font-family:sans-serif; }
-            .error-box { text-align:center; padding:40px; background:#1e293b; border-radius:20px; border:1px solid #f59e0b; box-shadow:0 10px 40px rgba(245,158,11,0.2); animation:fadeIn 0.5s ease; max-width:90%; width:400px; }
+            body { margin:0; height:100vh; display:flex; justify-content:center; align-items:center; background:#000; color:#fff; font-family:sans-serif; }
+            .error-box { text-align:center; padding:40px; background:#1e293b; border-radius:20px; border:1px solid #f59e0b; max-width:90%; width:400px; }
             .icon { font-size:60px; margin-bottom:20px; display:block; }
             h1 { margin:0 0 10px; color:#f59e0b; }
             p { color:#94a3b8; margin-bottom:25px; }
-            .btn { background:#334155; color:#fff; text-decoration:none; padding:10px 25px; border-radius:10px; transition:0.3s; display:inline-block; }
-            .btn:hover { background:#475569; }
-            @keyframes fadeIn { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+            .btn { background:#334155; color:#fff; text-decoration:none; padding:10px 25px; border-radius:10px; display:inline-block; }
         </style>
     </head>
     <body>
         <div class="error-box">
             <span class="icon">⚠️</span>
             <h1>دسترسی محدود</h1>
-            <p>فقط مدیر کل به این بخش دسترسی دارد.</p>
+            <p>فقط مدیران به این بخش دسترسی دارند.</p>
             <a href="index.php" class="btn">بازگشت به چت</a>
         </div>
     </body>
@@ -77,7 +46,7 @@ if ($_SESSION['username'] !== $admin_username) {
     exit;
 }
 
-if (isset($_GET['backup']) && isset($_GET['csrf_token']) && $_GET['csrf_token'] === $_SESSION['csrf_token']) {
+if (isset($_GET['backup']) && $isMainAdmin && isset($_GET['csrf_token']) && $_GET['csrf_token'] === $_SESSION['csrf_token']) {
     header('Content-Type: application/sql');
     header('Content-Disposition: attachment; filename="blackwacker_backup_' . date('Y-m-d_H-i-s') . '.sql"');
     
@@ -185,6 +154,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmtReportLock->execute();
             $isReportLocked = ($stmtReportLock->fetchColumn() === '1');
 
+            $stmtDeleteLock = $pdo->prepare("SELECT value FROM settings WHERE name = 'delete_lock'");
+            $stmtDeleteLock->execute();
+            $isDeleteLocked = ($stmtDeleteLock->fetchColumn() === '1');
+
+            $stmtMaxU = $pdo->prepare("SELECT value FROM settings WHERE name = 'max_users'");
+            $stmtMaxU->execute();
+            $maxUsersVal = $stmtMaxU->fetchColumn();
+            $currentMaxUsers = ($maxUsersVal !== false && (int)$maxUsersVal > 0) ? (int)$maxUsersVal : 3;
+
             $stmtAR = $pdo->prepare("SELECT value FROM settings WHERE name = 'auto_reset_enabled'");
             $stmtAR->execute();
             $autoResetEnabled = ($stmtAR->fetchColumn() === '1');
@@ -208,11 +186,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $autoResetText = "در حال اجرا...";
             }
 
-            $reports = $pdo->query("SELECT ur.id, ur.reason, ur.created_at, u1.username as reporter, u2.username as reported, u2.id as reported_id FROM user_reports ur JOIN users u1 ON ur.reporter_id = u1.id JOIN users u2 ON ur.reported_id = u2.id ORDER BY ur.created_at DESC LIMIT 20")->fetchAll(PDO::FETCH_ASSOC);
+            try {
+                // ensure status column exists on user_reports
+                $chkStatus = $pdo->query("SHOW COLUMNS FROM user_reports LIKE 'status'");
+                if ($chkStatus->rowCount() == 0) {
+                    $pdo->exec("ALTER TABLE user_reports ADD COLUMN status ENUM('pending','approved','rejected') DEFAULT 'pending'");
+                }
+                $chkReportCat = $pdo->query("SHOW COLUMNS FROM user_reports LIKE 'created_at'");
+                if ($chkReportCat->rowCount() == 0) {
+                    $pdo->exec("ALTER TABLE user_reports ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
+                }
+                $reports = $pdo->query("SELECT ur.id, ur.reason, ur.status, ur.created_at, u1.username as reporter, u2.username as reported, u2.id as reported_id FROM user_reports ur JOIN users u1 ON ur.reporter_id = u1.id JOIN users u2 ON ur.reported_id = u2.id ORDER BY FIELD(ur.status,'pending','approved','rejected'), ur.created_at DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
+            } catch (Exception $e) { $reports = []; }
             
             foreach ($reports as &$rep) {
                 $rep['time_ago'] = time_elapsed_string($rep['created_at']);
             }
+
+            $bannedIps = $pdo->query("SELECT id, ip_address, banned_at, reason FROM banned_ips ORDER BY banned_at DESC LIMIT 100")->fetchAll(PDO::FETCH_ASSOC);
 
             echo json_encode([
                 'status' => 'success',
@@ -223,9 +214,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'lock_voice' => $isVoiceLocked,
                 'site_lock' => $isSiteLocked,
                 'report_lock' => $isReportLocked,
+                'delete_lock' => $isDeleteLocked,
+                'max_users' => $currentMaxUsers,
                 'auto_reset_enabled' => $autoResetEnabled,
                 'auto_reset_text' => $autoResetText,
                 'auto_reset_recurring' => $autoResetRecurring,
+                'banned_ips' => $bannedIps,
+                'hide_admin_online' => (bool)($pdo->query("SELECT value FROM settings WHERE name='hide_admin_online'")->fetchColumn() === '1'),
                 'stats' => [
                     'users' => number_format($usersCount),
                     'msgs' => number_format($msgsCount),
@@ -306,6 +301,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode(['status' => 'success', 'message' => 'تمام پیام‌های سیستم پاکسازی شد']);
         }
         elseif ($action === 'import_db') {
+            if (!$isMainAdmin) {
+                echo json_encode(['status' => 'error', 'message' => 'فقط ادمین اصلی به این بخش دسترسی دارد']);
+                exit;
+            }
             if (!isset($_FILES['backup_file']) || $_FILES['backup_file']['error'] !== UPLOAD_ERR_OK) {
                 throw new Exception('فایلی انتخاب نشده است یا آپلود با خطا مواجه شد');
             }
@@ -390,6 +389,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->prepare("DELETE FROM messages WHERE sender_id = ?")->execute([$userId]);
             echo json_encode(['status' => 'success', 'message' => 'تمام پیام‌های کاربر حذف شد']);
         }
+        elseif ($action === 'burn_session') {
+            $userId = (int)$_POST['user_id'];
+            $stmt = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+            $stmt->execute([$userId]);
+            $targetUsername = $stmt->fetchColumn();
+            if (!$targetUsername) throw new Exception('کاربر یافت نشد');
+            if ($targetUsername === $admin_username) throw new Exception('سشن ادمین قابل سوزاندن نیست');
+            $pdo->prepare("UPDATE users SET is_online = 0, device_token = NULL WHERE id = ?")->execute([$userId]);
+            echo json_encode(['status' => 'success', 'message' => "سشن کاربر $targetUsername سوزانده شد"]);
+        }
+        elseif ($action === 'burn_all_sessions') {
+            $pdo->prepare("UPDATE users SET is_online = 0, device_token = NULL WHERE username != ?")->execute([$admin_username]);
+            echo json_encode(['status' => 'success', 'message' => 'سشن تمام کاربران (بجز ادمین) سوزانده شد']);
+        }
+        elseif ($action === 'set_max_users') {
+            $val = (int)$_POST['max_users'];
+            if ($val < 1 || $val > 9999) throw new Exception('عدد وارد شده معتبر نیست');
+            $chk = $pdo->prepare("SELECT name FROM settings WHERE name = 'max_users'");
+            $chk->execute();
+            if ($chk->fetch()) {
+                $pdo->prepare("UPDATE settings SET value = ? WHERE name = 'max_users'")->execute([$val]);
+            } else {
+                $pdo->prepare("INSERT INTO settings (name, value) VALUES ('max_users', ?)")->execute([$val]);
+            }
+            echo json_encode(['status' => 'success', 'message' => "سقف ساخت حساب به $val تغییر یافت"]);
+        }
         elseif ($action === 'toggle_upload_lock') {
             $stmt = $pdo->prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'lock_upload'");
             $stmt->execute();
@@ -422,23 +447,82 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->prepare("UPDATE settings SET value = ? WHERE name = 'report_lock'")->execute([$new]);
             echo json_encode(['status' => 'success', 'message' => ($new === '1' ? 'گزارش‌دهی قفل شد' : 'گزارش‌دهی آزاد شد')]);
         }
+        elseif ($action === 'toggle_delete_lock') {
+            $stmt = $pdo->prepare("SELECT value FROM settings WHERE name = 'delete_lock'");
+            $stmt->execute();
+            $curr = $stmt->fetchColumn();
+            $new = ($curr === '1') ? '0' : '1';
+            $pdo->prepare("UPDATE settings SET value = ? WHERE name = 'delete_lock'")->execute([$new]);
+            echo json_encode(['status' => 'success', 'message' => ($new === '1' ? 'حذف پیام‌ها و محتوا غیرفعال شد' : 'حذف پیام‌ها و محتوا فعال شد')]);
+        }
         elseif ($action === 'delete_report') {
             $id = (int)$_POST['id'];
             $pdo->prepare("DELETE FROM user_reports WHERE id = ?")->execute([$id]);
             echo json_encode(['status' => 'success', 'message' => 'گزارش حذف شد']);
         }
+
+        elseif ($action === 'approve_report') {
+            $id = (int)($_POST['id'] ?? 0);
+            $pdo->prepare("UPDATE user_reports SET status = 'approved' WHERE id = ?")->execute([$id]);
+            echo json_encode(['status' => 'success', 'message' => 'گزارش تأیید شد']);
+        }
+
+        elseif ($action === 'reject_report') {
+            $id = (int)($_POST['id'] ?? 0);
+            $pdo->prepare("UPDATE user_reports SET status = 'rejected' WHERE id = ?")->execute([$id]);
+            echo json_encode(['status' => 'success', 'message' => 'گزارش رد شد']);
+        }
+
         elseif ($action === 'get_user_msgs') {
             $targetId = (int)$_POST['user_id'];
-            $stmt = $pdo->prepare("SELECT m.*, u.username FROM messages m JOIN users u ON m.sender_id = u.id WHERE m.sender_id = ? ORDER BY m.created_at DESC LIMIT 100");
-            $stmt->execute([$targetId]);
+            $stmt = $pdo->prepare("
+                SELECT m.id, m.message, m.msg_type, m.file_name, m.room_name, m.receiver_id, m.created_at,
+                       u.username as sender_name
+                FROM messages m 
+                JOIN users u ON m.sender_id = u.id 
+                WHERE m.sender_id = ? OR m.receiver_id = ?
+                ORDER BY m.created_at DESC 
+                LIMIT 300
+            ");
+            $stmt->execute([$targetId, $targetId]);
             $msgs = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            foreach($msgs as &$m) {
-                 if($m['msg_type'] === 'text') $m['message'] = decrypt_data($m['message']);
-                 $ts = strtotime($m['created_at']);
-                 $m['created_at'] = jdate("Y/m/d H:i", $ts);
+
+            $stmtUser = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+            $stmtUser->execute([$targetId]);
+            $targetUsername = $stmtUser->fetchColumn();
+
+            $stmtAll = $pdo->query("SELECT id, username FROM users");
+            $usersMap = [];
+            foreach ($stmtAll->fetchAll(PDO::FETCH_ASSOC) as $u) {
+                $usersMap[$u['id']] = $u['username'];
             }
-            echo json_encode(['status' => 'success', 'messages' => $msgs]);
+
+            $grouped = [];
+            foreach ($msgs as &$m) {
+                if ($m['msg_type'] === 'text') $m['message'] = decrypt_data($m['message']);
+                $ts = strtotime($m['created_at']);
+                $m['created_at'] = jdate("Y/m/d H:i", $ts);
+
+                if ($m['room_name']) {
+                    $key = 'room::' . $m['room_name'];
+                    $label = 'اتاق: ' . $m['room_name'];
+                } elseif ($m['receiver_id']) {
+                    $otherId = ($m['sender_name'] === $targetUsername) ? $m['receiver_id'] : $targetId;
+                    $otherName = $usersMap[$otherId] ?? ('کاربر #' . $otherId);
+                    $key = 'pm::' . $otherId;
+                    $label = 'خصوصی با: ' . $otherName;
+                } else {
+                    $key = 'other';
+                    $label = 'سایر';
+                }
+
+                if (!isset($grouped[$key])) {
+                    $grouped[$key] = ['label' => $label, 'msgs' => []];
+                }
+                $grouped[$key]['msgs'][] = $m;
+            }
+
+            echo json_encode(['status' => 'success', 'groups' => array_values($grouped), 'target_username' => $targetUsername]);
         }
         elseif ($action === 'send_global_notif') {
             $msg = trim($_POST['message']);
@@ -454,6 +538,202 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->execute([$msg]);
             
             echo json_encode(['status' => 'success', 'message' => 'نوتیفیکیشن سراسری برای تمامی کاربران ارسال شد']);
+        }
+
+        elseif ($action === 'ban_ip') {
+            $ip = trim($_POST['ip_address']);
+            $reason = trim($_POST['reason'] ?? 'بن توسط مدیر');
+            if (empty($ip)) throw new Exception('آدرس IP نمی‌تواند خالی باشد');
+            if (!filter_var($ip, FILTER_VALIDATE_IP)) throw new Exception('آدرس IP معتبر نیست');
+            $pdo->prepare("INSERT IGNORE INTO banned_ips (ip_address, reason) VALUES (?, ?)")->execute([$ip, $reason]);
+            $pdo->prepare("UPDATE users SET is_banned_until = ? WHERE ip_address = ?")->execute([time() + (365 * 24 * 3600), $ip]);
+            $pdo->prepare("DELETE FROM user_sessions WHERE ip_address = ?")->execute([$ip]);
+            echo json_encode(['status' => 'success', 'message' => "آدرس IP $ip مسدود شد"]);
+        }
+        elseif ($action === 'unban_ip') {
+            $ip = trim($_POST['ip_address']);
+            if (empty($ip)) throw new Exception('آدرس IP نمی‌تواند خالی باشد');
+            $pdo->prepare("DELETE FROM banned_ips WHERE ip_address = ?")->execute([$ip]);
+            $pdo->prepare("UPDATE users SET is_banned_until = 0 WHERE ip_address = ? AND is_banned_until > 0")->execute([$ip]);
+            echo json_encode(['status' => 'success', 'message' => "مسدودیت IP $ip رفع شد"]);
+        }
+        elseif ($action === 'get_user_sessions') {
+            $targetId = (int)$_POST['user_id'];
+            $stmt = $pdo->prepare("SELECT id, session_token, ip_address, user_agent, created_at, last_activity FROM user_sessions WHERE user_id = ? ORDER BY last_activity DESC");
+            $stmt->execute([$targetId]);
+            $sessions = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $stmtUsr = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+            $stmtUsr->execute([$targetId]);
+            $uname = $stmtUsr->fetchColumn();
+            foreach ($sessions as &$s) {
+                $s['session_token_short'] = substr($s['session_token'], 0, 12) . '...';
+                $s['is_recent'] = (strtotime($s['last_activity']) > time() - 300);
+            }
+            echo json_encode(['status' => 'success', 'sessions' => $sessions, 'username' => $uname]);
+        }
+        elseif ($action === 'kill_session') {
+            $sessionId = (int)$_POST['session_id'];
+            $stmt = $pdo->prepare("SELECT user_id FROM user_sessions WHERE id = ?");
+            $stmt->execute([$sessionId]);
+            $row = $stmt->fetch();
+            if (!$row) throw new Exception('نشست یافت نشد');
+            $stmt2 = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+            $stmt2->execute([$row['user_id']]);
+            $uname = $stmt2->fetchColumn();
+            if ($uname === $admin_username) throw new Exception('نشست ادمین قابل حذف نیست');
+            $pdo->prepare("DELETE FROM user_sessions WHERE id = ?")->execute([$sessionId]);
+            echo json_encode(['status' => 'success', 'message' => 'نشست حذف شد. کاربر از حساب خارج می‌شود.']);
+        }
+        elseif ($action === 'kill_all_sessions_user') {
+            $targetId = (int)$_POST['user_id'];
+            $stmt2 = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+            $stmt2->execute([$targetId]);
+            $uname = $stmt2->fetchColumn();
+            if ($uname === $admin_username) throw new Exception('نشست‌های ادمین قابل حذف نیست');
+            $pdo->prepare("DELETE FROM user_sessions WHERE user_id = ?")->execute([$targetId]);
+            $pdo->prepare("UPDATE users SET is_online = 0, device_token = NULL WHERE id = ?")->execute([$targetId]);
+            echo json_encode(['status' => 'success', 'message' => "تمام نشست‌های $uname حذف شد"]);
+        }
+        elseif ($action === 'approve_report_and_ban') {
+            if (!$isMainAdmin) throw new Exception('فقط مدیر اصلی');
+            $id = (int)($_POST['id'] ?? 0);
+            $stmt = $pdo->prepare("SELECT reported_id FROM user_reports WHERE id = ?");
+            $stmt->execute([$id]);
+            $row = $stmt->fetch();
+            if (!$row) throw new Exception('گزارش یافت نشد');
+            $reportedId = $row['reported_id'];
+            $stmtU = $pdo->prepare("SELECT username, ip_address FROM users WHERE id = ?");
+            $stmtU->execute([$reportedId]);
+            $tgtUser = $stmtU->fetch();
+            if (!$tgtUser) throw new Exception('کاربر یافت نشد');
+            if ($tgtUser['username'] === $admin_username) throw new Exception('ادمین قابل مسدود شدن نیست');
+            $banTime = time() + (365 * 24 * 3600);
+            $pdo->prepare("UPDATE users SET is_banned_until = ?, is_online = 0 WHERE id = ?")->execute([$banTime, $reportedId]);
+            if ($tgtUser['ip_address']) {
+                $pdo->prepare("INSERT IGNORE INTO banned_ips (ip_address, reason) VALUES (?, 'تأیید گزارش')")->execute([$tgtUser['ip_address']]);
+            }
+            $pdo->prepare("UPDATE user_reports SET status = 'approved' WHERE id = ?")->execute([$id]);
+            echo json_encode(['status' => 'success', 'message' => 'گزارش تأیید و کاربر بن شد']);
+        }
+        elseif ($action === 'list_admins') {
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $rows = $pdo->query("SELECT id, username, display_name, created_by, created_at, last_login, is_active FROM admin_users ORDER BY created_at DESC")->fetchAll(PDO::FETCH_ASSOC);
+            echo json_encode(['status' => 'success', 'admins' => $rows]);
+        }
+        elseif ($action === 'add_admin') {
+            if (!$isMainAdmin) throw new Exception('فقط مدیر اصلی');
+            $uname = xss_clean(trim($_POST['username'] ?? ''));
+            $pass  = trim($_POST['password'] ?? '');
+            $dname = xss_clean(trim($_POST['display_name'] ?? $uname));
+            if (empty($uname) || empty($pass)) throw new Exception('نام کاربری و رمز عبور الزامی است');
+            if (strlen($pass) < 8) throw new Exception('رمز عبور باید حداقل ۸ کاراکتر باشد');
+            if ($uname === $admin_username) throw new Exception('این نام کاربری رزرو شده است');
+            $chk = $pdo->prepare("SELECT id FROM admin_users WHERE username = ?");
+            $chk->execute([$uname]);
+            if ($chk->fetch()) throw new Exception('این ادمین قبلاً ثبت شده است');
+            $hash = password_hash($pass, PASSWORD_DEFAULT);
+            $pdo->prepare("INSERT INTO admin_users (username, password_hash, display_name, created_by) VALUES (?, ?, ?, ?)")
+                ->execute([$uname, $hash, $dname, $admin_username]);
+            $chkUser = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+            $chkUser->execute([$uname]);
+            if (!$chkUser->fetch()) {
+                $pdo->prepare("INSERT INTO users (username, sticker, is_online) VALUES (?, '👑', 0)")->execute([$uname]);
+            }
+            echo json_encode(['status' => 'success', 'message' => "ادمین $uname اضافه شد"]);
+        }
+        elseif ($action === 'remove_admin') {
+            if (!$isMainAdmin) throw new Exception('فقط مدیر اصلی');
+            $id = (int)($_POST['admin_id'] ?? 0);
+            $pdo->prepare("DELETE FROM admin_users WHERE id = ?")->execute([$id]);
+            echo json_encode(['status' => 'success', 'message' => 'ادمین حذف شد']);
+        }
+        elseif ($action === 'toggle_admin_active') {
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $id = (int)($_POST['admin_id'] ?? 0);
+            $stmt = $pdo->prepare("SELECT is_active FROM admin_users WHERE id = ?");
+            $stmt->execute([$id]);
+            $row = $stmt->fetch();
+            if (!$row) throw new Exception('ادمین یافت نشد');
+            $new = $row['is_active'] ? 0 : 1;
+            $pdo->prepare("UPDATE admin_users SET is_active = ? WHERE id = ?")->execute([$new, $id]);
+            echo json_encode(['status' => 'success', 'message' => $new ? 'ادمین فعال شد' : 'ادمین غیرفعال شد']);
+        }
+        elseif ($action === 'get_hide_admin_state') {
+            $stmt2 = $pdo->prepare("SELECT value FROM settings WHERE name = 'hide_admin_online'");
+            $stmt2->execute();
+            $val = $stmt2->fetchColumn();
+            echo json_encode(['status' => 'success', 'state' => ($val === '1') ? 1 : 0]);
+        }
+        elseif ($action === 'toggle_hide_admin_online') {
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $stmt = $pdo->prepare("SELECT value FROM settings WHERE name = 'hide_admin_online'");
+            $stmt->execute();
+            $curr = $stmt->fetchColumn();
+            $new = ($curr === '1') ? '0' : '1';
+            $pdo->prepare("UPDATE settings SET value = ? WHERE name = 'hide_admin_online'")->execute([$new]);
+            if ($new === '1') {
+                $pdo->prepare("UPDATE users SET is_online = 0 WHERE username = ?")->execute([$admin_username]);
+            }
+            echo json_encode(['status' => 'success', 'message' => ($new === '1' ? 'وضعیت آنلاین ادمین مخفی شد' : 'وضعیت آنلاین ادمین نمایش داده می‌شود'), 'state' => (int)$new]);
+        }
+        elseif ($action === 'create_channel') {
+            $name    = xss_clean(trim($_POST['name'] ?? ''));
+            $type    = ($_POST['type'] ?? 'public') === 'private' ? 'private' : 'public';
+            $cat     = xss_clean(trim($_POST['category'] ?? ''));
+            if (empty($name)) throw new Exception('نام کانال نمی‌تواند خالی باشد');
+            $inviteCode = ($type === 'private') ? bin2hex(random_bytes(4)) : null;
+            $pdo->prepare("INSERT INTO rooms (name, type, room_kind, created_by, invite_code, category) VALUES (?, ?, 'channel', ?, ?, ?)")
+                ->execute([$name, $type, $_SESSION['user_id'], $inviteCode, $cat ?: null]);
+            echo json_encode(['status' => 'success', 'message' => "کانال $name ساخته شد", 'invite_code' => $inviteCode]);
+        }
+        elseif ($action === 'delete_channel') {
+            $id = (int)($_POST['id'] ?? 0);
+            $stmt = $pdo->prepare("SELECT name, room_kind FROM rooms WHERE id = ?");
+            $stmt->execute([$id]);
+            $row = $stmt->fetch();
+            if (!$row) throw new Exception('کانال یافت نشد');
+            if ($row['room_kind'] !== 'channel') throw new Exception('این مورد کانال نیست');
+            $pdo->beginTransaction();
+            $pdo->prepare("DELETE FROM messages WHERE room_name = ?")->execute([$row['name']]);
+            $pdo->prepare("DELETE FROM room_invites WHERE room_name = ?")->execute([$row['name']]);
+            $pdo->prepare("DELETE FROM channel_members WHERE channel_name = ?")->execute([$row['name']]);
+            $pdo->prepare("DELETE FROM rooms WHERE id = ?")->execute([$id]);
+            $pdo->commit();
+            echo json_encode(['status' => 'success', 'message' => 'کانال حذف شد']);
+        }
+        elseif ($action === 'list_update_notifs') {
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $rows = $pdo->query("SELECT * FROM update_notifications ORDER BY created_at DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
+            echo json_encode(['status' => 'success', 'notifications' => $rows]);
+        }
+        elseif ($action === 'add_update_notif') {
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $title = xss_clean(trim($_POST['title'] ?? ''));
+            $msg   = xss_clean(trim($_POST['message'] ?? ''));
+            $icon  = trim($_POST['icon'] ?? '🔔');
+            $type  = in_array($_POST['type'] ?? 'info', ['info','warning','success','update']) ? $_POST['type'] : 'info';
+            if (empty($title) || empty($msg)) throw new Exception('عنوان و متن الزامی است');
+            $pdo->prepare("INSERT INTO update_notifications (title, message, icon, type, is_active) VALUES (?, ?, ?, ?, 1)")
+                ->execute([$title, $msg, $icon, $type]);
+            echo json_encode(['status' => 'success', 'message' => 'اطلاعیه اضافه شد']);
+        }
+        elseif ($action === 'delete_update_notif') {
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $id = (int)($_POST['id'] ?? 0);
+            $pdo->prepare("DELETE FROM update_notifications WHERE id = ?")->execute([$id]);
+            $pdo->prepare("DELETE FROM update_notif_seen WHERE notif_id = ?")->execute([$id]);
+            echo json_encode(['status' => 'success', 'message' => 'اطلاعیه حذف شد']);
+        }
+        elseif ($action === 'toggle_update_notif') {
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $id = (int)($_POST['id'] ?? 0);
+            $stmt = $pdo->prepare("SELECT is_active FROM update_notifications WHERE id = ?");
+            $stmt->execute([$id]);
+            $row = $stmt->fetch();
+            if (!$row) throw new Exception('اطلاعیه یافت نشد');
+            $new = $row['is_active'] ? 0 : 1;
+            $pdo->prepare("UPDATE update_notifications SET is_active = ? WHERE id = ?")->execute([$new, $id]);
+            echo json_encode(['status' => 'success', 'message' => $new ? 'فعال شد' : 'غیرفعال شد']);
         }
 
     } catch (Exception $e) {
@@ -624,10 +904,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 </div>
 
 <div id="msgViewModal" class="modal-overlay">
-    <div class="modal-content" style="max-width:600px;">
-        <h3 style="margin-top:0; margin-bottom:15px; font-size:1.2rem; color:#fff" id="msgViewTitle">پیام‌های کاربر</h3>
+    <div class="modal-content" style="max-width:650px;">
+        <h3 style="margin-top:0; margin-bottom:12px; font-size:1.2rem; color:#fff" id="msgViewTitle">پیام‌های کاربر</h3>
+        <div id="msgViewTabs" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; padding-bottom:12px; border-bottom:1px solid rgba(255,255,255,0.08);"></div>
         <div class="msg-list" id="msgViewList"></div>
-        <button onclick="closeModal('msgViewModal')" class="btn btn-ghost" style="width:100%; padding:15px;">بستن</button>
+        <button onclick="closeModal('msgViewModal')" class="btn btn-ghost" style="width:100%; padding:15px; margin-top:10px;">بستن</button>
     </div>
 </div>
 
@@ -652,6 +933,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <?php if ($isMainAdmin): ?>
     <div class="card">
         <div class="card-header">
             <h2 class="card-title">مدیریت دیتابیس (بکاپ و بازگردانی)</h2>
@@ -672,6 +954,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
         </div>
     </div>
+
+    <?php endif; // isMainAdmin - backup ?>
 
     <div class="card">
         <div class="card-header">
@@ -702,12 +986,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <button id="reportLockBtn" onclick="toggleReportLock()" class="btn btn-primary">تغییر وضعیت</button>
             </div>
 
+            <div class="action-box" style="flex-direction:row; align-items:center; justify-content:space-between; flex-wrap:wrap;">
+                <div>
+                    <h4 style="margin:0; color:#fff;">قفل حذف پیام‌ها و محتوا 🗑️</h4>
+                    <div id="deleteLockStatusText" style="font-size:0.9rem; color:var(--text-muted); margin-top:5px">در حال بررسی...</div>
+                </div>
+                <button id="deleteLockBtn" onclick="toggleDeleteLock()" class="btn btn-primary">تغییر وضعیت</button>
+            </div>
+
             <div class="action-box" style="flex-direction:row; align-items:center; justify-content:space-between; flex-wrap:wrap; border-color:rgba(239, 68, 68, 0.3); grid-column: 1 / -1;">
                 <div>
                     <h4 style="margin:0; color:#fff;">وضعیت قفل کل سایت (Maintenance)</h4>
                     <div id="siteLockStatusText" style="font-size:0.9rem; color:var(--text-muted); margin-top:5px">در حال بررسی...</div>
                 </div>
                 <button id="siteLockBtn" onclick="toggleSiteLock()" class="btn btn-danger">تغییر وضعیت</button>
+            </div>
+
+            <div class="action-box" style="grid-column: 1 / -1;">
+                <h4 style="margin:0 0 12px; color:#fff;">سقف ساخت حساب (تعداد مجاز کاربران جدید از هر دستگاه)</h4>
+                <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:14px;">وضعیت فعلی: <span id="maxUsersStatusText" style="color:#a5b4fc; font-weight:bold;">در حال بررسی...</span></div>
+                <div class="input-group">
+                    <input type="number" id="maxUsersInput" class="form-control" placeholder="مثلاً ۵" min="1" max="9999" style="max-width:160px;">
+                    <button onclick="setMaxUsers()" class="btn btn-primary">ذخیره</button>
+                </div>
             </div>
         </div>
     </div>
@@ -804,6 +1105,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <div class="card" id="ipBanCard">
+        <div class="card-header">
+            <h2 class="card-title">مدیریت بن IP</h2>
+        </div>
+        <div class="action-box">
+            <h4>بن کردن آدرس IP</h4>
+            <p style="font-size:0.85rem;color:var(--text-muted);margin-top:0;">کاربر با این آدرس IP از هر مرورگری نمی‌تواند وارد شود.</p>
+            <div class="input-group">
+                <input type="text" id="banIpInput" class="form-control" placeholder="مثلاً 192.168.1.1" dir="ltr">
+                <input type="text" id="banIpReason" class="form-control" placeholder="دلیل (اختیاری)">
+                <button onclick="banIpAction()" class="btn btn-danger">بن IP 🚫</button>
+            </div>
+        </div>
+        <div class="table-responsive" id="bannedIpsTableWrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>آدرس IP</th>
+                        <th>دلیل</th>
+                        <th>تاریخ بن</th>
+                        <th width="120">عملیات</th>
+                    </tr>
+                </thead>
+                <tbody id="bannedIpsList"></tbody>
+            </table>
+        </div>
+    </div>
+
     <div class="card">
         <div class="card-header">
             <h2 class="card-title">کاربران و اعضا</h2>
@@ -815,6 +1144,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <div class="action-box">
             <h4>جستجوی کاربر</h4>
             <input type="text" id="searchUser" class="form-control" placeholder="نام کاربری را وارد کنید..." onkeyup="filterUsers()">
+        </div>
+
+        <div class="action-box" style="flex-direction:row; align-items:center; justify-content:space-between; flex-wrap:wrap; background:rgba(239,68,68,0.05); border-color:rgba(239,68,68,0.25);">
+            <div>
+                <h4 style="margin:0; color:#fff;">سوزاندن همه سشن‌ها</h4>
+                <div style="font-size:0.85rem; color:var(--text-muted); margin-top:4px;">تمام کاربران (بجز ادمین) از حساب خارج و device_token پاک می‌شود</div>
+            </div>
+            <button onclick="confirmAction('burn_all_sessions', 0, 'سشن تمام کاربران (بجز ادمین) سوزانده می‌شود. ادامه می‌دهید؟')" class="btn btn-danger" style="white-space:nowrap">🔥 سوزاندن همه</button>
         </div>
 
         <div class="table-responsive">
@@ -834,6 +1171,83 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <div id="paginationControls" style="display:flex; justify-content:center; flex-wrap:wrap; gap:5px; margin-top:20px;"></div>
     </div>
 
+    <div class="card" id="channelsCard">
+        <div class="card-header"><h2 class="card-title">مدیریت کانال‌ها</h2></div>
+        <div class="action-box">
+            <h4>ساخت کانال جدید</h4>
+            <div class="input-group">
+                <input type="text" id="newChannelName" class="form-control" placeholder="نام کانال (۳-۲۰ حرف)" maxlength="20">
+                <select id="newChannelType" class="form-control" style="max-width:140px;">
+                    <option value="public">عمومی 📢</option>
+                    <option value="private">خصوصی 🔐</option>
+                </select>
+                <input type="text" id="newChannelCat" class="form-control" placeholder="دسته‌بندی (اختیاری)" style="max-width:150px;">
+                <button onclick="createChannel()" class="btn btn-primary">ساخت کانال</button>
+            </div>
+        </div>
+        <div class="table-responsive">
+            <table>
+                <thead><tr><th>نام</th><th>نوع</th><th>دسته‌بندی</th><th>کد دعوت</th><th>سازنده</th><th width="120">عملیات</th></tr></thead>
+                <tbody id="channelsList"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card" id="adminsCard" style="<?php echo $isMainAdmin ? '' : 'display:none;'; ?>">
+        <div class="card-header"><h2 class="card-title">مدیریت ادمین‌ها</h2></div>
+        <div class="action-box">
+            <h4>افزودن ادمین جدید</h4>
+            <p style="font-size:0.85rem;color:var(--text-muted);margin-top:0;">ادمین‌های فرعی می‌توانند به پنل مدیریت دسترسی داشته باشند.</p>
+            <div class="input-group">
+                <input type="text" id="newAdminUser" class="form-control" placeholder="نام کاربری">
+                <input type="password" id="newAdminPass" class="form-control" placeholder="رمز عبور (حداقل ۸ کاراکتر)">
+                <input type="text" id="newAdminDisplay" class="form-control" placeholder="نام نمایشی (اختیاری)">
+                <button onclick="addAdmin()" class="btn btn-primary">افزودن ادمین</button>
+            </div>
+        </div>
+        <div class="table-responsive">
+            <table>
+                <thead><tr><th>نام کاربری</th><th>نام نمایشی</th><th>آخرین ورود</th><th>وضعیت</th><th width="140">عملیات</th></tr></thead>
+                <tbody id="adminsList"></tbody>
+            </table>
+        </div>
+        <div class="action-box" style="margin-top:16px;background:rgba(99,102,241,0.07);border-color:rgba(99,102,241,0.2);">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                <div>
+                    <h4 style="margin:0;color:#fff;">مخفی کردن وضعیت آنلاین ادمین</h4>
+                    <div style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">کاربران وضعیت آنلاین/آفلاین ادمین را نمی‌بینند</div>
+                </div>
+                <button id="hideAdminOnlineBtn" onclick="toggleHideAdminOnline()" class="btn btn-primary" style="white-space:nowrap;">بارگذاری...</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card" id="updateNotifsCard" style="<?php echo $isMainAdmin ? '' : 'display:none;'; ?>">
+        <div class="card-header"><h2 class="card-title">اطلاعیه‌های آپدیت</h2></div>
+        <div class="action-box">
+            <h4>افزودن اطلاعیه جدید</h4>
+            <div class="input-group">
+                <input type="text" id="notifTitle" class="form-control" placeholder="عنوان اطلاعیه">
+                <input type="text" id="notifIcon" class="form-control" placeholder="آیکون (مثل 🔔)" style="max-width:80px;" value="🔔">
+                <select id="notifType" class="form-control" style="max-width:130px;">
+                    <option value="info">اطلاعیه 🔵</option>
+                    <option value="update">آپدیت 🟣</option>
+                    <option value="success">موفقیت 🟢</option>
+                    <option value="warning">هشدار 🟡</option>
+                </select>
+            </div>
+            <textarea id="notifMsg" class="form-control" style="width:100%;min-height:80px;resize:vertical;margin-top:8px;" placeholder="متن اطلاعیه..."></textarea>
+            <button onclick="addUpdateNotif()" class="btn btn-primary" style="margin-top:10px;width:100%;">➕ افزودن اطلاعیه</button>
+        </div>
+        <div class="table-responsive">
+            <table>
+                <thead><tr><th>آیکون</th><th>عنوان</th><th>نوع</th><th>وضعیت</th><th>تاریخ</th><th width="120">عملیات</th></tr></thead>
+                <tbody id="updateNotifsList"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <?php if ($isMainAdmin): ?>
     <div class="card danger-zone">
         <div class="card-header">
             <h2 class="card-title danger-card-title">ناحیه خطرناک</h2>
@@ -851,6 +1265,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <button onclick="globalReset()" class="btn btn-danger">انجام ریست کامل</button>
             </div>
         </div>
+    </div>
+    <?php endif; // isMainAdmin - danger zone ?>
+</div>
+
+<div id="sessionsModal" class="modal-overlay">
+    <div class="modal-content" style="max-width:700px;">
+        <h3 style="margin-top:0;font-size:1.2rem;color:#fff" id="sessionsModalTitle">نشست‌های فعال</h3>
+        <div id="sessionsModalBody" style="overflow-y:auto;max-height:60vh;margin-bottom:15px;"></div>
+        <button onclick="closeModal('sessionsModal')" class="btn btn-ghost" style="width:100%;padding:15px;">بستن</button>
     </div>
 </div>
 
@@ -910,7 +1333,7 @@ function performAction(action, id, extraData = {}) {
     fd.append('action', action);
     fd.append('csrf_token', csrfToken);
     
-    if (id) fd.append(action.includes('user') || action === 'get_user_msgs' ? 'user_id' : 'id', id);
+    if (id) fd.append(action.includes('user') || action === 'get_user_msgs' || action === 'burn_session' || action === 'view_user_msgs' ? 'user_id' : 'id', id);
     for (let k in extraData) fd.append(k, extraData[k]);
 
     fetch('admin.php', { method: 'POST', body: fd })
@@ -1011,6 +1434,10 @@ function toggleReportLock() {
     performAction('toggle_report_lock', 0);
 }
 
+function toggleDeleteLock() {
+    performAction('toggle_delete_lock', 0);
+}
+
 function sendGlobalNotif() {
     const msg = document.getElementById('globalNotifMsg').value;
     if(!msg) return showToast('متن پیام خالی است', 'error');
@@ -1023,38 +1450,60 @@ function sendGlobalNotif() {
     };
 }
 
+let _msgGroups = [];
+
 function viewUserMsgs(id, name) {
     const fd = new FormData();
     fd.append('action', 'get_user_msgs');
     fd.append('user_id', id);
     fd.append('csrf_token', csrfToken);
     
-    document.getElementById('msgViewList').innerHTML = '<div style="text-align:center;color:#94a3b8">در حال بارگذاری...</div>';
+    document.getElementById('msgViewList').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">در حال بارگذاری...</div>';
+    document.getElementById('msgViewTabs').innerHTML = '';
     document.getElementById('msgViewTitle').textContent = 'پیام‌های ' + name;
     document.getElementById('msgViewModal').style.display = 'flex';
     
     fetch('admin.php', { method: 'POST', body: fd })
     .then(r => r.json())
     .then(d => {
-        if(d.status === 'success') {
-            let html = '';
-            if(d.messages.length > 0) {
-                d.messages.forEach(m => {
-                    const typeIcon = m.msg_type === 'text' ? '📝' : (m.msg_type === 'voice' ? '🎤' : '📁');
-                    const content = m.msg_type === 'text' ? m.message : (m.msg_type === 'voice' ? 'پیام صوتی' : 'فایل: ' + m.file_name);
-                    html += `<div class="admin-msg-item">
-                        <div class="admin-msg-meta"><span>${m.room_name || 'خصوصی'}</span><span>${m.created_at}</span></div>
-                        <div style="color:#fff">${typeIcon} ${content}</div>
-                    </div>`;
-                });
-            } else {
-                html = '<div style="text-align:center;color:#94a3b8;padding:20px">هیچ پیامی یافت نشد</div>';
+        if (d.status === 'success') {
+            _msgGroups = d.groups || [];
+            if (_msgGroups.length === 0) {
+                document.getElementById('msgViewTabs').innerHTML = '';
+                document.getElementById('msgViewList').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">هیچ پیامی یافت نشد</div>';
+                return;
             }
-            document.getElementById('msgViewList').innerHTML = html;
+            renderMsgTabs(0);
         } else {
             showToast(d.message, 'error');
         }
     });
+}
+
+function renderMsgTabs(activeIdx) {
+    const tabsEl = document.getElementById('msgViewTabs');
+    let tabHtml = '';
+    _msgGroups.forEach((g, i) => {
+        const isActive = i === activeIdx;
+        tabHtml += `<button onclick="renderMsgTabs(${i})" style="padding:6px 14px; border-radius:10px; border:1px solid ${isActive ? 'rgba(99,102,241,0.7)' : 'rgba(255,255,255,0.12)'}; background:${isActive ? 'rgba(99,102,241,0.25)' : 'rgba(255,255,255,0.05)'}; color:${isActive ? '#a5b4fc' : '#94a3b8'}; cursor:pointer; font-family:inherit; font-size:0.8rem; white-space:nowrap; transition:all 0.2s;">${g.label} <span style="opacity:0.6">(${g.msgs.length})</span></button>`;
+    });
+    tabsEl.innerHTML = tabHtml;
+
+    const msgs = _msgGroups[activeIdx].msgs;
+    let html = '';
+    msgs.forEach(m => {
+        const typeIcon = m.msg_type === 'text' ? '📝' : (m.msg_type === 'voice' ? '🎤' : '📁');
+        const content = m.msg_type === 'text' ? (m.message || '') : (m.msg_type === 'voice' ? 'پیام صوتی' : 'فایل: ' + (m.file_name || ''));
+        const isSent = m.sender_name === _msgGroups[activeIdx].label.split(': ')[1] || m.sender_name;
+        html += `<div class="admin-msg-item">
+            <div class="admin-msg-meta">
+                <span style="color:#a5b4fc">${m.sender_name}</span>
+                <span>${m.created_at}</span>
+            </div>
+            <div style="color:#fff; word-break:break-word">${typeIcon} ${content}</div>
+        </div>`;
+    });
+    document.getElementById('msgViewList').innerHTML = html;
 }
 
 function refreshData() {
@@ -1112,6 +1561,20 @@ function refreshData() {
                     reportLockText.innerHTML = '<span style="color:#10b981">✔ گزارش‌دهی فعال است</span>';
                 }
 
+                const deleteLockBtn = document.getElementById('deleteLockBtn');
+                const deleteLockText = document.getElementById('deleteLockStatusText');
+                if (d.delete_lock) {
+                    deleteLockBtn.textContent = 'فعال کردن حذف';
+                    deleteLockBtn.className = 'btn btn-success';
+                    deleteLockBtn.style.background = '#10b981';
+                    deleteLockText.innerHTML = '<span style="color:#ef4444">🔒 حذف پیام‌ها و محتوا غیرفعال است</span>';
+                } else {
+                    deleteLockBtn.textContent = 'غیرفعال کردن حذف';
+                    deleteLockBtn.className = 'btn btn-danger';
+                    deleteLockBtn.style.background = '';
+                    deleteLockText.innerHTML = '<span style="color:#10b981">✔ حذف پیام‌ها و محتوا فعال است</span>';
+                }
+
                 const siteLockBtn = document.getElementById('siteLockBtn');
                 const siteLockText = document.getElementById('siteLockStatusText');
                 if (d.site_lock) {
@@ -1131,12 +1594,34 @@ function refreshData() {
                     document.getElementById('autoResetRecurring').checked = true;
                 }
 
+                if (d.max_users !== undefined) {
+                    document.getElementById('maxUsersStatusText').textContent = d.max_users + ' حساب از هر دستگاه';
+                    const inp = document.getElementById('maxUsersInput');
+                    if (inp && !inp.value) inp.placeholder = d.max_users;
+                }
+
                 updateRooms(d.rooms);
                 allUsersCache = d.users;
                 renderUsers();
                 updateReports(d.reports);
+                updateBannedIps(d.banned_ips || []);
+                updateChannelsList(d.rooms || []);
+                loadAdminsList();
+                loadUpdateNotifs();
+                loadHideAdminOnlineState();
             }
         });
+}
+
+function setMaxUsers() {
+    const val = parseInt(document.getElementById('maxUsersInput').value);
+    if (!val || val < 1) return showToast('یک عدد معتبر وارد کنید', 'error');
+    confirmAction('set_max_users', 0, `سقف ساخت حساب به ${val} تغییر می‌یابد. ادامه می‌دهید؟`);
+    document.getElementById('confirmYes').onclick = () => {
+        closeModal('confirmModal');
+        performAction('set_max_users', 0, { max_users: val });
+        document.getElementById('maxUsersInput').value = '';
+    };
 }
 
 function updateRooms(rooms) {
@@ -1174,15 +1659,21 @@ function updateReports(reports) {
     }
     let html = '';
     reports.forEach(r => {
+        const statusBadge = r.status === 'approved' ? '<span style="color:#10b981;font-size:11px;">✔ تأیید شده</span>' : r.status === 'rejected' ? '<span style="color:#ef4444;font-size:11px;">✘ رد شده</span>' : '<span style="color:#fbbf24;font-size:11px;">⏳ در انتظار</span>';
+        const actionBtns = r.status === 'pending' ? `
+            <button onclick="performAction('approve_report', ${r.id}, null, 'تأیید گزارش و اقدام')" class="btn btn-sm" style="background:rgba(16,185,129,0.2);border-color:rgba(16,185,129,0.4);color:#6ee7b7">✔ تأیید</button>
+            <button onclick="approveReportAndBan(${r.id})" class="btn btn-sm" style="background:rgba(239,68,68,0.2);border-color:rgba(239,68,68,0.4);color:#fca5a5">🚫 تأیید+بن</button>
+            <button onclick="performAction('reject_report', ${r.id})" class="btn btn-sm" style="background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.3);color:#fca5a5">✘ رد</button>
+            <button onclick="openBanModal(${r.reported_id}, '${r.reported}')" class="btn btn-danger btn-sm">🚫 بن</button>
+        ` : `<button onclick="confirmAction('delete_report', ${r.id}, 'حذف گزارش؟')" class="btn btn-ghost btn-sm" style="color:#ef4444;border-color:#ef4444">🗑</button>`;
         html += `<tr id="report-${r.id}">
             <td style="color:#a5b4fc">${r.reporter}</td>
             <td style="color:#f87171; font-weight:bold">${r.reported}</td>
-            <td><div style="max-width:200px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis" title="${r.reason}">${r.reason}</div></td>
-            <td style="font-size:0.8rem; color:#94a3b8">${r.time_ago}</td>
+            <td><div style="max-width:180px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis" title="${r.reason}">${r.reason}</div></td>
+            <td style="font-size:0.8rem; color:#94a3b8">${r.time_ago}<br>${statusBadge}</td>
             <td>
-                <div style="display:flex; justify-content:flex-end; gap:5px">
-                    <button onclick="openBanModal(${r.reported_id}, '${r.reported}')" class="btn btn-danger btn-sm">مسدود</button>
-                    <button onclick="confirmAction('delete_report', ${r.id}, 'حذف گزارش؟')" class="btn btn-ghost btn-sm" style="color:#ef4444; border-color:#ef4444">✘</button>
+                <div style="display:flex; justify-content:flex-end; gap:5px; flex-wrap:wrap">
+                    ${actionBtns}
                 </div>
             </td>
         </tr>`;
@@ -1211,6 +1702,8 @@ function renderUsers() {
                 : `<button onclick="openBanModal(${u.id}, '${u.username}')" class="btn btn-danger btn-sm" style="margin-left:5px">مسدود</button>`;
             
             actions = `${banBtn}
+            <button onclick="viewUserSessions(${u.id}, '${u.username}')" class="btn btn-primary btn-sm" style="margin-left:5px; background:linear-gradient(135deg,#0ea5e9,#38bdf8);" title="نشست‌های فعال">📡</button>
+            <button onclick="confirmAction('burn_session', ${u.id}, 'سشن کاربر ${u.username} سوزانده می‌شود و از حساب خارج می‌شود. ادامه می‌دهید؟')" class="btn btn-danger btn-sm" style="margin-left:5px; background:linear-gradient(135deg,#b45309,#f59e0b); border:none;" title="سوزاندن همه سشن‌ها">🔥</button>
             <button onclick="viewUserMsgs(${u.id}, '${u.username}')" class="btn btn-primary btn-sm" style="margin-left:5px; background:linear-gradient(135deg, #3b82f6, #60a5fa)">👁</button>
             <button onclick="confirmAction('delete_user_msgs', ${u.id}, 'تمام پیام‌های کاربر ${u.username} حذف شود؟')" class="btn btn-ghost btn-sm" style="color:#ef4444; border-color:#ef4444">پاکسازی</button>`;
         }
@@ -1257,6 +1750,357 @@ function filterUsers() {
 
 setInterval(refreshData, 3000);
 refreshData();
+
+function banIpAction() {
+    const ip = document.getElementById('banIpInput').value.trim();
+    const reason = document.getElementById('banIpReason').value.trim() || 'بن توسط مدیر';
+    if (!ip) return showToast('آدرس IP را وارد کنید', 'error');
+    confirmAction('ban_ip', 0, `آیا از مسدود کردن IP ${ip} اطمئن هستید؟`);
+    document.getElementById('confirmYes').onclick = () => {
+        closeModal('confirmModal');
+        const fd = new FormData();
+        fd.append('action', 'ban_ip');
+        fd.append('csrf_token', csrfToken);
+        fd.append('ip_address', ip);
+        fd.append('reason', reason);
+        fetch('admin.php', { method: 'POST', body: fd })
+            .then(r => r.json())
+            .then(d => {
+                if (d.status === 'success') {
+                    showToast(d.message);
+                    document.getElementById('banIpInput').value = '';
+                    document.getElementById('banIpReason').value = '';
+                    refreshData();
+                } else {
+                    showToast(d.message, 'error');
+                }
+            });
+    };
+}
+
+function unbanIpAction(ip) {
+    confirmAction('unban_ip', 0, `رفع مسدودیت IP ${ip}؟`);
+    document.getElementById('confirmYes').onclick = () => {
+        closeModal('confirmModal');
+        const fd = new FormData();
+        fd.append('action', 'unban_ip');
+        fd.append('csrf_token', csrfToken);
+        fd.append('ip_address', ip);
+        fetch('admin.php', { method: 'POST', body: fd })
+            .then(r => r.json())
+            .then(d => {
+                if (d.status === 'success') { showToast(d.message); refreshData(); }
+                else showToast(d.message, 'error');
+            });
+    };
+}
+
+function updateBannedIps(ips) {
+    const tbody = document.getElementById('bannedIpsList');
+    if (!ips || ips.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#94a3b8">هیچ IP مسدودی وجود ندارد</td></tr>';
+        return;
+    }
+    let html = '';
+    ips.forEach(ip => {
+        html += `<tr>
+            <td style="direction:ltr;font-family:monospace;color:#f87171">${ip.ip_address}</td>
+            <td>${ip.reason || '-'}</td>
+            <td style="font-size:0.8rem;color:#94a3b8">${ip.banned_at || '-'}</td>
+            <td><button onclick="unbanIpAction('${ip.ip_address}')" class="btn btn-success btn-sm">رفع بن</button></td>
+        </tr>`;
+    });
+    if (tbody.innerHTML !== html) tbody.innerHTML = html;
+}
+
+function viewUserSessions(userId, username) {
+    document.getElementById('sessionsModalTitle').textContent = 'نشست‌های فعال: ' + username;
+    document.getElementById('sessionsModalBody').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">در حال بارگذاری...</div>';
+    document.getElementById('sessionsModal').style.display = 'flex';
+    
+    const fd = new FormData();
+    fd.append('action', 'get_user_sessions');
+    fd.append('user_id', userId);
+    fd.append('csrf_token', csrfToken);
+    
+    fetch('admin.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status !== 'success') { showToast(d.message, 'error'); return; }
+            const sessions = d.sessions || [];
+            if (sessions.length === 0) {
+                document.getElementById('sessionsModalBody').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">هیچ نشست فعالی یافت نشد</div>';
+                return;
+            }
+            let html = `<div style="margin-bottom:10px;display:flex;justify-content:flex-end;">
+                <button onclick="killAllSessions(${userId},'${username}')" class="btn btn-danger btn-sm">🔥 حذف همه نشست‌ها</button>
+            </div>`;
+            sessions.forEach(s => {
+                const isActive = s.is_recent;
+                const statusDot = isActive ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-left:6px;box-shadow:0 0 6px #10b981"></span>' : '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#6b7280;margin-left:6px;"></span>';
+                html += `<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;margin-bottom:8px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+                        <div>
+                            ${statusDot}<span style="color:${isActive ? '#34d399' : '#94a3b8'};font-size:0.85rem;">${isActive ? 'فعال' : 'غیرفعال'}</span>
+                            <div style="font-family:monospace;font-size:0.8rem;color:#818cf8;margin-top:4px;direction:ltr">${s.ip_address || '-'}</div>
+                            <div style="font-size:0.75rem;color:#64748b;margin-top:2px;">آخرین فعالیت: ${s.last_activity}</div>
+                            <div style="font-size:0.7rem;color:#475569;margin-top:2px;direction:ltr;word-break:break-all;">${s.user_agent ? s.user_agent.substring(0,80)+'...' : '-'}</div>
+                        </div>
+                        <button onclick="killSession(${s.id},'${username}')" class="btn btn-danger btn-sm" style="flex-shrink:0">حذف نشست</button>
+                    </div>
+                </div>`;
+            });
+            document.getElementById('sessionsModalBody').innerHTML = html;
+        })
+        .catch(() => showToast('خطای شبکه', 'error'));
+}
+
+function killSession(sessionId, username) {
+    if (!confirm(`نشست حذف شود و کاربر ${username} از حساب خارج می‌شود؟`)) return;
+    const fd = new FormData();
+    fd.append('action', 'kill_session');
+    fd.append('session_id', sessionId);
+    fd.append('csrf_token', csrfToken);
+    fetch('admin.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status === 'success') {
+                showToast(d.message);
+                closeModal('sessionsModal');
+                refreshData();
+            } else showToast(d.message, 'error');
+        });
+}
+
+function killAllSessions(userId, username) {
+    if (!confirm(`تمام نشست‌های ${username} حذف شود؟`)) return;
+    const fd = new FormData();
+    fd.append('action', 'kill_all_sessions_user');
+    fd.append('user_id', userId);
+    fd.append('csrf_token', csrfToken);
+    fetch('admin.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status === 'success') {
+                showToast(d.message);
+                closeModal('sessionsModal');
+                refreshData();
+            } else showToast(d.message, 'error');
+        });
+}
+
+function updateChannelsList(rooms) {
+    const tbody = document.getElementById('channelsList');
+    if (!tbody) return;
+    const channels = rooms.filter(r => r.room_kind === 'channel');
+    if (!channels.length) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:20px;">کانالی وجود ندارد</td></tr>';
+        return;
+    }
+    tbody.innerHTML = channels.map(r => {
+        const typeLabel = r.type === 'public' ? '<span style="background:rgba(16,185,129,0.15);color:#34d399;padding:2px 10px;border-radius:8px;font-size:12px;">عمومی 📢</span>' : '<span style="background:rgba(99,102,241,0.15);color:#a5b4fc;padding:2px 10px;border-radius:8px;font-size:12px;">خصوصی 🔐</span>';
+        const invCode = r.invite_code ? `<span style="font-family:monospace;font-size:12px;color:#818cf8;background:rgba(99,102,241,0.1);padding:2px 8px;border-radius:6px;cursor:pointer;" onclick="navigator.clipboard.writeText('${r.invite_code}').then(()=>showToast('کپی شد'))">${r.invite_code}</span>` : '—';
+        return `<tr>
+            <td style="font-weight:bold;">📢 ${escapeAdminHtml(r.name)}</td>
+            <td>${typeLabel}</td>
+            <td>${r.category ? escapeAdminHtml(r.category) : '—'}</td>
+            <td>${invCode}</td>
+            <td>${escapeAdminHtml(r.creator || 'سیستم')}</td>
+            <td><button onclick="deleteChannelAdmin(${r.id},'${escapeAdminHtml(r.name)}')" class="btn btn-danger btn-sm">🗑 حذف</button></td>
+        </tr>`;
+    }).join('');
+}
+
+function createChannel() {
+    const name = document.getElementById('newChannelName').value.trim();
+    const type = document.getElementById('newChannelType').value;
+    const cat  = document.getElementById('newChannelCat').value.trim();
+    if (!name) return showToast('نام کانال را وارد کنید', 'error');
+    performActionCustom('create_channel', { name, type, category: cat }, d => {
+        showToast(d.message);
+        document.getElementById('newChannelName').value = '';
+        document.getElementById('newChannelCat').value = '';
+        refreshData();
+    });
+}
+
+function deleteChannelAdmin(id, name) {
+    if (!confirm(`کانال "${name}" حذف شود؟`)) return;
+    performAction('delete_channel', id);
+    setTimeout(refreshData, 700);
+}
+
+function loadAdminsList() {
+    const tbody = document.getElementById('adminsList');
+    if (!tbody) return;
+    const fd = new FormData();
+    fd.append('action', 'list_admins');
+    fd.append('csrf_token', csrfToken);
+    fetch('admin.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status !== 'success') return;
+            if (!d.admins.length) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:20px;">هیچ ادمین فرعی ثبت نشده</td></tr>';
+                return;
+            }
+            tbody.innerHTML = d.admins.map(a => {
+                const activeLabel = a.is_active == 1 ? '<span style="color:#34d399;font-size:12px;">✔ فعال</span>' : '<span style="color:#ef4444;font-size:12px;">✕ غیرفعال</span>';
+                const lastLogin = a.last_login ? a.last_login.substr(0, 16) : 'هرگز';
+                return `<tr>
+                    <td style="font-weight:bold;font-family:monospace;">${escapeAdminHtml(a.username)}</td>
+                    <td>${escapeAdminHtml(a.display_name || '—')}</td>
+                    <td style="font-size:12px;color:#64748b;">${lastLogin}</td>
+                    <td>${activeLabel}</td>
+                    <td style="display:flex;gap:6px;">
+                        <button onclick="toggleAdminActive(${a.id})" class="btn btn-sm" style="background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);">${a.is_active ? 'غیرفعال' : 'فعال'}</button>
+                        <button onclick="removeAdmin(${a.id},'${escapeAdminHtml(a.username)}')" class="btn btn-danger btn-sm">🗑</button>
+                    </td>
+                </tr>`;
+            }).join('');
+        });
+}
+
+function addAdmin() {
+    const uname = document.getElementById('newAdminUser').value.trim();
+    const pass  = document.getElementById('newAdminPass').value;
+    const dname = document.getElementById('newAdminDisplay').value.trim();
+    if (!uname || !pass) return showToast('نام کاربری و رمز عبور الزامی است', 'error');
+    if (pass.length < 8) return showToast('رمز عبور باید حداقل ۸ کاراکتر باشد', 'error');
+    performActionCustom('add_admin', { username: uname, password: pass, display_name: dname }, d => {
+        showToast(d.message);
+        document.getElementById('newAdminUser').value = '';
+        document.getElementById('newAdminPass').value = '';
+        document.getElementById('newAdminDisplay').value = '';
+        loadAdminsList();
+    });
+}
+
+function removeAdmin(id, name) {
+    if (!confirm(`ادمین "${name}" حذف شود؟`)) return;
+    performActionCustom('remove_admin', { admin_id: id }, d => { showToast(d.message); loadAdminsList(); });
+}
+
+function toggleAdminActive(id) {
+    performActionCustom('toggle_admin_active', { admin_id: id }, d => { showToast(d.message); loadAdminsList(); });
+}
+
+let _hideAdminOnlineState = false;
+function loadHideAdminOnlineState() {
+    const btn = document.getElementById('hideAdminOnlineBtn');
+    if (!btn) return;
+    // use performActionCustom to get current state
+    const fd = new FormData();
+    fd.append('action', 'get_hide_admin_state');
+    fd.append('csrf_token', csrfToken);
+    fetch('admin.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status === 'success') {
+                _hideAdminOnlineState = d.state == 1;
+                btn.textContent = _hideAdminOnlineState ? '✔ آنلاین مخفی است — کلیک برای نمایش' : '👁 نمایش آنلاین — کلیک برای مخفی کردن';
+                btn.className = _hideAdminOnlineState ? 'btn btn-success' : 'btn btn-primary';
+                btn.disabled = false;
+            }
+        })
+        .catch(() => {
+            btn.textContent = '👁 وضعیت آنلاین ادمین';
+            btn.disabled = false;
+        });
+}
+
+function toggleHideAdminOnline() {
+    performActionCustom('toggle_hide_admin_online', {}, d => {
+        showToast(d.message);
+        _hideAdminOnlineState = (d.state == 1);
+        const btn = document.getElementById('hideAdminOnlineBtn');
+        if (btn) {
+            btn.textContent = _hideAdminOnlineState ? '✔ آنلاین مخفی است — کلیک برای نمایش' : '👁 نمایش آنلاین — کلیک برای مخفی کردن';
+            btn.className = _hideAdminOnlineState ? 'btn btn-success' : 'btn btn-primary';
+        }
+    });
+}
+
+function loadUpdateNotifs() {
+    const tbody = document.getElementById('updateNotifsList');
+    if (!tbody) return;
+    const fd = new FormData();
+    fd.append('action', 'list_update_notifs');
+    fd.append('csrf_token', csrfToken);
+    fetch('admin.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status !== 'success') return;
+            if (!d.notifications.length) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:20px;">هیچ اطلاعیه‌ای ثبت نشده</td></tr>';
+                return;
+            }
+            const typeColors = { info: '#6366f1', update: '#8b5cf6', success: '#10b981', warning: '#f59e0b' };
+            tbody.innerHTML = d.notifications.map(n => {
+                const col = typeColors[n.type] || '#6366f1';
+                const activeLabel = n.is_active == 1 ? '<span style="color:#34d399;font-size:12px;">✔ فعال</span>' : '<span style="color:#ef4444;font-size:12px;">✕ غیرفعال</span>';
+                return `<tr>
+                    <td style="font-size:22px;text-align:center;">${n.icon}</td>
+                    <td style="font-weight:bold;">${escapeAdminHtml(n.title)}</td>
+                    <td><span style="background:${col}22;color:${col};padding:2px 10px;border-radius:8px;font-size:12px;">${n.type}</span></td>
+                    <td>${activeLabel}</td>
+                    <td style="font-size:12px;color:#64748b;">${(n.created_at || '').substr(0,10)}</td>
+                    <td style="display:flex;gap:4px;">
+                        <button onclick="toggleUpdateNotif(${n.id})" class="btn btn-sm" style="background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);">${n.is_active ? 'غیرفعال' : 'فعال'}</button>
+                        <button onclick="deleteUpdateNotif(${n.id})" class="btn btn-danger btn-sm">🗑</button>
+                    </td>
+                </tr>`;
+            }).join('');
+        });
+}
+
+function addUpdateNotif() {
+    const title = document.getElementById('notifTitle').value.trim();
+    const msg   = document.getElementById('notifMsg').value.trim();
+    const icon  = document.getElementById('notifIcon').value.trim() || '🔔';
+    const type  = document.getElementById('notifType').value;
+    if (!title || !msg) return showToast('عنوان و متن الزامی است', 'error');
+    performActionCustom('add_update_notif', { title, message: msg, icon, type }, d => {
+        showToast(d.message);
+        document.getElementById('notifTitle').value = '';
+        document.getElementById('notifMsg').value = '';
+        document.getElementById('notifIcon').value = '🔔';
+        loadUpdateNotifs();
+    });
+}
+
+function toggleUpdateNotif(id) {
+    performActionCustom('toggle_update_notif', { id }, d => { showToast(d.message); loadUpdateNotifs(); });
+}
+
+function deleteUpdateNotif(id) {
+    if (!confirm('این اطلاعیه حذف شود؟')) return;
+    performActionCustom('delete_update_notif', { id }, d => { showToast(d.message); loadUpdateNotifs(); });
+}
+
+function approveReportAndBan(id) {
+    if (!confirm('گزارش تأیید شده و کاربر بن شود؟')) return;
+    performActionCustom('approve_report_and_ban', { id }, d => { showToast(d.message); refreshData(); });
+}
+
+function performActionCustom(action, data, successCb) {
+    const fd = new FormData();
+    fd.append('action', action);
+    fd.append('csrf_token', csrfToken);
+    for (const k in data) fd.append(k, data[k]);
+    fetch('admin.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status === 'success') { if (successCb) successCb(d); }
+            else showToast(d.message || 'خطا', 'error');
+        })
+        .catch(() => showToast('خطا در ارتباط', 'error'));
+}
+
+function escapeAdminHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>'"]/g, t => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t]));
+}
 
 </script>
 </body>
