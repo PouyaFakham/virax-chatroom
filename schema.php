@@ -484,6 +484,22 @@ if (!defined('VEYRAX_SCHEMA_PHP')) {
     }
 
     function veyrax_upgrade($pdo, $prefix = '') {
+        // One-time repair: older builds wrote the network/runtime settings into the
+        // legacy `settings` table while every reader used veyrax_setting()
+        // (system_settings) — so "حالت عادی" was saved and never seen. Carry any
+        // existing choice over the first time this migration runs.
+        try {
+            foreach (['request_mode', 'cache_ttl_hours', 'cache_epoch'] as $runtimeKey) {
+                $chkNew = $pdo->prepare("SELECT setting_key FROM system_settings WHERE setting_key = ? LIMIT 1");
+                $chkNew->execute([$runtimeKey]);
+                if ($chkNew->fetch()) continue;
+                $oldVal = $pdo->query("SELECT value FROM settings WHERE name = " . $pdo->quote($runtimeKey) . " LIMIT 1")->fetchColumn();
+                if ($oldVal !== false && $oldVal !== null && $oldVal !== '') {
+                    $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)")->execute([$runtimeKey, (string)$oldVal]);
+                }
+            }
+        } catch (Exception $e) { error_log('[VIRAX schema] runtime settings migration: ' . $e->getMessage()); }
+
         foreach (['ai_enabled','ai_base_url','ai_api_key','ai_model','ai_system_prompt','ai_behavior','ai_max_tokens','ai_temperature','ai_timeout','ai_cooldown','ai_rooms','ai_mention_only'] as $k) {
             try { $pdo->prepare("INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES (?, '')")->execute([$k]); } catch (Exception $e) {}
         }

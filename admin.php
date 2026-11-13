@@ -913,29 +913,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $ttl = (int)($_POST['cache_ttl_hours'] ?? 24);
             if ($ttl < 1) $ttl = 1;
             if ($ttl > 720) $ttl = 720;
-            $updates = ['request_mode' => $mode, 'cache_ttl_hours' => (string)$ttl];
-            foreach ($updates as $k => $v) {
-                $chk = $pdo->prepare("SELECT name FROM settings WHERE name = ?");
-                $chk->execute([$k]);
-                if ($chk->fetch()) {
-                    $pdo->prepare("UPDATE settings SET value = ? WHERE name = ?")->execute([$v, $k]);
-                } else {
-                    $pdo->prepare("INSERT INTO settings (name, value) VALUES (?, ?)")->execute([$k, $v]);
-                }
-            }
+            // These two values are read back through veyrax_setting(), which is
+            // backed by system_settings. Writing them into the legacy `settings`
+            // table is why "حالت عادی" never stuck: the save succeeded, the read
+            // never saw it. Always go through the setter.
+            veyrax_setting_set($pdo, 'request_mode', $mode);
+            veyrax_setting_set($pdo, 'cache_ttl_hours', (string)$ttl);
             echo json_encode(['status' => 'success', 'message' => 'تنظیمات شبکه و کش ذخیره شد', 'request_mode' => $mode, 'cache_ttl_hours' => $ttl]);
         }
         elseif ($action === 'bump_cache_epoch') {
             if (!$isFullAdmin) throw new Exception('دسترسی محدود');
             $cur = (int)veyrax_setting($pdo, 'cache_epoch', '0');
             $next = (string)($cur + 1);
-            $chk = $pdo->prepare("SELECT name FROM settings WHERE name = 'cache_epoch'");
-            $chk->execute();
-            if ($chk->fetch()) {
-                $pdo->prepare("UPDATE settings SET value = ? WHERE name = 'cache_epoch'")->execute([$next]);
-            } else {
-                $pdo->prepare("INSERT INTO settings (name, value) VALUES ('cache_epoch', ?)")->execute([$next]);
-            }
+            veyrax_setting_set($pdo, 'cache_epoch', $next);
             echo json_encode(['status' => 'success', 'message' => 'کش همه کاربران پاک‌سازی شد', 'cache_epoch' => (int)$next]);
         }
         elseif ($action === 'delete_report') {

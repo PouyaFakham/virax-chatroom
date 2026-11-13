@@ -1137,8 +1137,8 @@ function veyrax_require_not_banned(array $userRow) {
 }
 
 // Bump together with schema.php when the database layout changes.
-if (!defined('VEYRAX_SCHEMA_VERSION')) define('VEYRAX_SCHEMA_VERSION', '2026.11.13.2');
-define('VEYRAX_ASSET_VERSION', '1.8.7');
+if (!defined('VEYRAX_SCHEMA_VERSION')) define('VEYRAX_SCHEMA_VERSION', '2026.11.13.3');
+define('VEYRAX_ASSET_VERSION', '1.8.8');
 
 /**
  * Tables that get an unprefixed compatibility VIEW when a prefix is used.
