@@ -1,0 +1,17 @@
+{
+  "name": "veyrax-websocket",
+  "version": "1.0.0",
+  "description": "VEYRAX real-time WebSocket server",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.8.4"
+  }
+}

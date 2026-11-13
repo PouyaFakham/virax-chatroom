@@ -47,7 +47,7 @@ if (!preg_match('/^[a-f0-9]{32}$/', $token)) {
     exit;
 }
 
-$stmt = $pdo->prepare("SELECT file_path, file_name, msg_type, sender_id, receiver_id, room_name FROM messages WHERE file_token = ? LIMIT 1");
+$stmt = $pdo->prepare("SELECT file_path, file_name, msg_type, sender_id, receiver_id, room_name FROM messages WHERE file_token = ? AND media_deleted = 0 LIMIT 1");
 $stmt->execute([$token]);
 $file = $stmt->fetch();
 
@@ -85,13 +85,20 @@ if (!$isAdmin) {
     }
 }
 
+$realBase = realpath('uploads');
+$realFile = realpath($file['file_path']);
+if ($realBase === false || $realFile === false || strpos($realFile, $realBase . DIRECTORY_SEPARATOR) !== 0 || basename($realFile) === '.htaccess') {
+    header('HTTP/1.0 404 Not Found');
+    exit;
+}
+
 if (!file_exists($file['file_path'])) {
     header('HTTP/1.0 404 Not Found');
     exit;
 }
 
 $content = file_get_contents($file['file_path']);
-$decrypted = decrypt_data($content);
+$decrypted = decrypt_file_data($content);
 
 if ($decrypted === false) {
     header('HTTP/1.0 500 Internal Server Error');
@@ -126,6 +133,10 @@ $safeName = preg_replace('/[^a-zA-Z0-9._\-]/', '_', $randomName);
 if ($isMedia && !$dl && !$isBrowserNav) {
     header("Content-Type: " . $mimeTypes[$ext]);
     header("Content-Disposition: inline; filename=\"" . $safeName . "\"");
+    if ($ext === 'svg') {
+        // An uploaded SVG must not be able to run scripts on this origin.
+        header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    }
 } else {
     header('Content-Description: File Transfer');
     header('Content-Type: application/octet-stream');
@@ -135,8 +146,39 @@ if ($isMedia && !$dl && !$isBrowserNav) {
 header('Expires: 0');
 header('Cache-Control: must-revalidate');
 header('Pragma: public');
-header('Content-Length: ' . strlen($decrypted));
+// Never let a browser second-guess the type we declared: an uploaded file is
+// user content and must not be sniffed into something executable.
 header('X-Content-Type-Options: nosniff');
+header('Accept-Ranges: bytes');
+
+// HTTP Range support (needed for seekable audio/video players).
+$range = $_SERVER['HTTP_RANGE'] ?? '';
+$size = strlen($decrypted);
+$start = 0;
+$end = $size - 1;
+$status = 200;
+if ($range !== '' && preg_match('/^bytes=(\d*)-(\d*)$/', trim($range), $m)) {
+    if ($m[1] === '' && $m[2] !== '') {
+        $suffix = (int)$m[2];
+        $start = max(0, $size - $suffix);
+    } else {
+        $start = (int)$m[1];
+        if ($m[2] !== '') $end = (int)$m[2];
+    }
+    if ($start > $end || $start >= $size) {
+        http_response_code(416);
+        header('Content-Range: bytes */' . $size);
+        exit;
+    }
+    if ($end >= $size) $end = $size - 1;
+    header('Content-Range: bytes ' . $start . '-' . $end . '/' . $size);
+    header('Content-Length: ' . ($end - $start + 1));
+    http_response_code(206);
+    echo substr($decrypted, $start, $end - $start + 1);
+    exit;
+}
+
+header('Content-Length: ' . $size);
 
 echo $decrypted;
 exit;

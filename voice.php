@@ -41,11 +41,13 @@ if (!preg_match('/^[a-f0-9]{32}$/', $token)) {
     exit;
 }
 
-$stmt = $pdo->prepare("SELECT file_path, msg_type, sender_id, receiver_id, room_name FROM messages WHERE file_token = ? AND msg_type = 'voice' LIMIT 1");
+$stmt = $pdo->prepare("SELECT file_path, msg_type, sender_id, receiver_id, room_name FROM messages WHERE file_token = ? AND msg_type = 'voice' AND media_deleted = 0 LIMIT 1");
 $stmt->execute([$token]);
 $file = $stmt->fetch();
 
-if (!$file || !file_exists($file['file_path'])) {
+$realBase = realpath('uploads');
+$realFile = $file ? realpath($file['file_path']) : false;
+if ($realBase === false || $realFile === false || strpos($realFile, $realBase . DIRECTORY_SEPARATOR) !== 0) {
     header('HTTP/1.1 404 Not Found');
     exit;
 }
@@ -79,7 +81,7 @@ if (!$isAdmin) {
 }
 
 $content = file_get_contents($file['file_path']);
-$decrypted = decrypt_data($content);
+$decrypted = decrypt_file_data($content);
 
 if ($decrypted === false) {
     header('HTTP/1.1 500 Internal Server Error');
