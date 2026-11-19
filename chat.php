@@ -1966,23 +1966,25 @@ function veyrax_chat_rev(PDO $pdo, $userId, $room, $targetId) {
             $roomId = isset($_POST['room']) ? $_POST['room'] : null;
             if ($roomId === 'public') $roomId = 'گفتگوی عمومی';
             $targetUserId = isset($_POST['target_user']) && is_numeric($_POST['target_user']) ? (int)$_POST['target_user'] : null;
+
+            // Same two values the 'wait' action builds from its own POST body.
+            // They were referenced here without ever being assigned, so every
+            // cold poll (after_id = 0) raised two "Undefined variable" warnings
+            // and then anchored to the wrong conversation.
+            $waitTarget = (int)($targetUserId ?? 0);
+            $waitRoom   = ($roomId !== null && $roomId !== '' && $roomId !== 'null') ? (string)$roomId : 'گفتگوی عمومی';
+            if ($waitRoom === 'public') $waitRoom = 'گفتگوی عمومی';
+
+            // after_id = 0 means "this client has nothing on screen yet", and
+            // the only correct answer to that is the latest page of history —
+            // see the ORDER BY ... DESC LIMIT 20 branch further down.
+            //
+            // The 'wait' action has its own copy of this variable, and there
+            // anchoring to the tip is correct: a long-poll must react to NEW
+            // rows only. This action is the one that paints the room, so
+            // anchoring here left every fresh page load with an empty list and
+            // made a just-sent message vanish on the next repaint.
             $afterId = isset($_POST['after_id']) && is_numeric($_POST['after_id']) ? (int)$_POST['after_id'] : 0;
-            if ($afterId <= 0) {
-                // A client that has not loaded this conversation yet (empty PV,
-                // first open) anchors to the current tip so the wait reacts to
-                // NEW rows only. Anchoring to 0 matched the whole table and
-                // turned the long-poll into a busy loop (429 storm).
-                try {
-                    if ($waitTarget > 0) {
-                        $stTip = $pdo->prepare("SELECT COALESCE(MAX(id),0) FROM messages WHERE room_name IS NULL AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))");
-                        $stTip->execute([$userId, $waitTarget, $waitTarget, $userId]);
-                    } else {
-                        $stTip = $pdo->prepare("SELECT COALESCE(MAX(id),0) FROM messages WHERE room_name = ? AND receiver_id IS NULL");
-                        $stTip->execute([$waitRoom]);
-                    }
-                    $afterId = (int)$stTip->fetchColumn();
-                } catch (Exception $e) { $afterId = 0; }
-            }
 
             // A poll that already knows where it is (after_id > 0) only needs
             // the new messages + counters. The room list, system settings,

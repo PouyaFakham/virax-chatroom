@@ -1,6 +1,9 @@
 <?php
 require_once 'config.php';
 
+// The login page itself is a target: no framing, no indexing, no referrer.
+vx_admin_headers();
+
 // اگر کاربر عادی لاگین شده، دسترسی نداره
 if (isset($_SESSION['user_id']) && $_SESSION['username'] !== $admin_username) {
     ?>
@@ -45,6 +48,9 @@ if (isset($_SESSION['user_id']) && $_SESSION['username'] === $admin_username) {
 
 // پردازش لاگین
 $error_message = '';
+if (isset($_GET['expired'])) {
+    $error_message = 'نشست شما به دلیل بی‌کاری منقضی شد. دوباره وارد شوید.';
+}
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!isset($_POST['csrf_token']) || !is_string($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'] ?? '', $_POST['csrf_token'])) {
         $error_message = 'درخواست نامعتبر است';
@@ -82,7 +88,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $admin = $stmt->fetch();
 
                 if (!$admin) {
-                    $hashedPass = password_hash($admin_password, PASSWORD_BCRYPT);
+                    // Store a hash of the password the admin just typed. Never
+                    // hash the stored value: on a hardened install that value
+                    // is already a bcrypt hash and double-hashing locks the
+                    // account out on the very next login.
+                    $hashedPass = password_hash($password, PASSWORD_BCRYPT);
                     $stmt = $pdo->prepare("INSERT INTO users (username, password_hash, sticker) VALUES (?, ?, '👑')");
                     $stmt->execute([$admin_username, $hashedPass]);
                     $admin_id = $pdo->lastInsertId();
@@ -98,16 +108,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $_SESSION['sticker'] = $admin_sticker;
                 $_SESSION['is_admin'] = true;
                 $_SESSION['admin_login_failures'] = 0;
+                $_SESSION['vx_admin_seen'] = time();
                 unset($_SESSION['admin_login_locked_until']);
                 $_SESSION['logout_nonce'] = bin2hex(random_bytes(16));
 
                 $stmt = $pdo->prepare("UPDATE users SET last_activity = NOW(), is_online = 1 WHERE id = ?");
                 $stmt->execute([$admin_id]);
 
+                vx_audit('admin.login_ok', ['user' => $admin_username]);
+
                 header('Location: admin.php');
                 exit;
             } else {
                 veyrax_throttle_record($pdo, $adminLoginIp, $username, 'admin_login', false);
+                vx_audit('admin.login_failed', ['user' => substr($username, 0, 40)]);
                 $_SESSION['admin_login_failures'] = ($_SESSION['admin_login_failures'] ?? 0) + 1;
                 if ($_SESSION['admin_login_failures'] >= 5) {
                     $_SESSION['admin_login_locked_until'] = time() + 300;

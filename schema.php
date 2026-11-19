@@ -23,7 +23,7 @@ if (!defined('VEYRAX_SCHEMA_PHP')) {
         $prefix = preg_replace('/[^A-Za-z0-9_]/', '', (string)$prefix);
         $t = function ($name) use ($prefix) { return $prefix . $name; };
         $step = function ($label) use ($onProgress) {
-            if (is_callable($onProgress)) call_user_func($onProgress, $label);
+            if (is_callable($onProgress)) $onProgress($label);
         };
         $charset = 'utf8mb4';
         $collate = 'utf8mb4_general_ci';

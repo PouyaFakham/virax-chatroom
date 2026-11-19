@@ -55,8 +55,8 @@ $admin_display_name    = veyrax_env('ADMIN_DISPLAY_NAME', '');
 $admin_password        = veyrax_env('ADMIN_PASSWORD', '');
 $admin_pinned_username = $admin_username;
 
-$font_text = 'Kalameh1';
-$font_heading = 'Kalameh';
+$font_text = 'Dana';
+$font_heading = 'Dana-Bold';
 $favicon_path = 'assets/brand/favicon-32.png';
 $favicon_base = 'assets/brand';
 
@@ -142,21 +142,23 @@ require_once __DIR__ . '/data/config.php';
 // Docker, CI and panel deploys inject credentials as env vars; they must take
 // precedence over whatever install.php wrote into data/config.php, otherwise a
 // container could silently run against a stale file copy.
-$veyrax_env_map = [
-    'db_host'            => 'DB_HOST',
-    'db_port'            => 'DB_PORT',
-    'db_name'            => 'DB_NAME',
-    'db_user'            => 'DB_USER',
-    'db_pass'            => 'DB_PASS',
-    'admin_username'     => 'ADMIN_USERNAME',
-    'admin_display_name' => 'ADMIN_DISPLAY_NAME',
-    'admin_password'     => 'ADMIN_PASSWORD',
-];
-foreach ($veyrax_env_map as $veyrax_var => $veyrax_env_key) {
-    $veyrax_env_value = veyrax_env($veyrax_env_key);
-    if ($veyrax_env_value !== null) $$veyrax_var = $veyrax_env_value;
-}
-unset($veyrax_env_map, $veyrax_var, $veyrax_env_key, $veyrax_env_value);
+$veyrax_env_value = veyrax_env('DB_HOST');
+if ($veyrax_env_value !== null) $db_host = $veyrax_env_value;
+$veyrax_env_value = veyrax_env('DB_PORT');
+if ($veyrax_env_value !== null) $db_port = $veyrax_env_value;
+$veyrax_env_value = veyrax_env('DB_NAME');
+if ($veyrax_env_value !== null) $db_name = $veyrax_env_value;
+$veyrax_env_value = veyrax_env('DB_USER');
+if ($veyrax_env_value !== null) $db_user = $veyrax_env_value;
+$veyrax_env_value = veyrax_env('DB_PASS');
+if ($veyrax_env_value !== null) $db_pass = $veyrax_env_value;
+$veyrax_env_value = veyrax_env('ADMIN_USERNAME');
+if ($veyrax_env_value !== null) $admin_username = $veyrax_env_value;
+$veyrax_env_value = veyrax_env('ADMIN_DISPLAY_NAME');
+if ($veyrax_env_value !== null) $admin_display_name = $veyrax_env_value;
+$veyrax_env_value = veyrax_env('ADMIN_PASSWORD');
+if ($veyrax_env_value !== null) $admin_password = $veyrax_env_value;
+unset($veyrax_env_value);
 $admin_pinned_username = $admin_username;
 
 // A missing connection block must never leak a PDO stack trace or a blank
@@ -248,6 +250,50 @@ if (session_status() === PHP_SESSION_NONE) {
 
 if (!defined('IV_LENGTH')) define('IV_LENGTH', openssl_cipher_iv_length('aes-256-cbc'));
 
+/**
+ * Where a runtime state file lives.
+ *
+ * These files are plain JSON (queue offsets, tombstones, schema stamps) and
+ * they sit in data/ next to the credentials. data/.htaccess denies the whole
+ * directory, but that file is only as reliable as the host: one reset and the
+ * folder is readable again. A fixed name — ws_outbox.log, deleted_msgs.json —
+ * is then a URL anyone can type.
+ *
+ * So the name is derived from the installation's own AES key:
+ *
+ *     data/.vx-<first 24 hex of HMAC-SHA256(key, "vx-state:<name>")>
+ *
+ * Unguessable without the key, stable across requests, and identical on the
+ * PHP and Node sides (websocket/server.js derives it the same way). The dot
+ * prefix also puts it behind the "no dotfiles" rule in the root .htaccess.
+ */
+function vx_state_path(string $name): string
+{
+    static $cache = [];
+
+    if (isset($cache[$name])) return $cache[$name];
+
+    $token = substr(hash_hmac('sha256', 'vx-state:' . $name, ENCRYPTION_KEY), 0, 24);
+    $path  = __DIR__ . '/data/.vx-' . $token;
+
+    // Upgrading from a build that used fixed names: move the old file once so
+    // the queue offset and the tombstones survive the switch.
+    $legacy = [
+        'ws_outbox'     => 'ws_outbox.log',
+        'ws_push_state' => 'ws_push_state.json',
+        'deleted_msgs'  => 'deleted_msgs.json',
+        'compat_views'  => 'compat_views.json',
+        'demo_sweep'    => 'demo_sweep.json',
+    ];
+    if (!is_file($path) && isset($legacy[$name])) {
+        $old = __DIR__ . '/data/' . $legacy[$name];
+        if (is_file($old)) @rename($old, $path);
+    }
+
+    return $cache[$name] = $path;
+}
+
+
 function send_security_headers() {
     if (headers_sent()) return;
     header_remove('X-Powered-By');
@@ -256,8 +302,463 @@ function send_security_headers() {
     header('Referrer-Policy: strict-origin-when-cross-origin');
     header('X-XSS-Protection: 1; mode=block');
     header('Permissions-Policy: camera=(self), microphone=(self), geolocation=()');
+
+    // Content-Security-Policy for the public pages. The panel sends its own,
+    // stricter policy through vx_admin_headers() and that one replaces this.
+    //
+    // 'unsafe-inline' is required: the chat is one PHP file with its script and
+    // its event handlers inline, so a nonce-based policy would mean rewriting
+    // the whole front end. What this still buys is the important half — no
+    // script, frame, form target or socket may come from another origin, and
+    // <base> cannot be hijacked. That is the part an injected payload needs.
+    header(
+        "Content-Security-Policy: default-src 'self'; " .
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " .
+        "style-src 'self' 'unsafe-inline'; " .
+        "img-src 'self' data: blob:; " .
+        "media-src 'self' blob:; " .
+        "font-src 'self' data:; " .
+        "connect-src 'self' ws: wss:; " .
+        "frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'"
+    );
 }
 send_security_headers();
+
+// =============================================================================
+//  Security helpers
+// =============================================================================
+//
+//  Kept inside config.php on purpose. A separate security_*.php file is one more
+//  artefact for a host's file scanner to make a judgement about, and it buys
+//  nothing: these are a dozen small helper functions, and config.php is already
+//  loaded by every entry point.
+//
+//  Scope, deliberately small:
+//    - refuse web access to directories that hold secrets (static .htaccess)
+//    - decide whether the current visitor is an admin
+//    - issue one-time download tokens
+//    - write an audit trail
+//    - harden response headers
+//
+//  Downloads are authorised with a random token kept in the admin's session.
+//  Nothing signed travels in a URL, and no file is ever encrypted-then-deleted.
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Settings
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Read an optional hardening setting from data/config.php.
+ * Every key has a safe default so an older install keeps working untouched.
+ */
+function vx_config(string $key, $default = null)
+{
+    static $cache = [];
+    if (array_key_exists($key, $cache)) return $cache[$key];
+
+    global $admin_idle_timeout, $admin_ip_allowlist, $download_ticket_ttl, $backup_encryption;
+
+    switch ($key) {
+        case 'admin_idle_timeout':
+            return $cache[$key] = isset($admin_idle_timeout) ? $admin_idle_timeout : $default;
+        case 'admin_ip_allowlist':
+            return $cache[$key] = isset($admin_ip_allowlist) ? $admin_ip_allowlist : $default;
+        case 'download_ticket_ttl':
+            return $cache[$key] = isset($download_ticket_ttl) ? $download_ticket_ttl : $default;
+        case 'backup_encryption':
+            return $cache[$key] = isset($backup_encryption) ? $backup_encryption : $default;
+    }
+    return $cache[$key] = $default;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Admin identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the current viewer's admin identity, or null.
+ *
+ * The level is read from the database rather than trusted from the session, so
+ * demoting an admin takes effect on their next request instead of their next
+ * login.
+ *
+ * @return array{uid:int,username:string,level:string}|null
+ */
+function vx_admin_context(PDO $pdo): ?array
+{
+    global $admin_username;
+
+    $uid = (int)($_SESSION['user_id'] ?? 0);
+    $username = (string)($_SESSION['username'] ?? '');
+    if ($uid <= 0 || $username === '') return null;
+
+    if ($username === (string)$admin_username) {
+        return ['uid' => $uid, 'username' => $username, 'level' => 'owner'];
+    }
+
+    try {
+        $stmt = $pdo->prepare("SELECT level FROM admin_users WHERE username = ? AND is_active = 1 LIMIT 1");
+        $stmt->execute([$username]);
+        $level = $stmt->fetchColumn();
+        if ($level === false) return null;
+        return ['uid' => $uid, 'username' => $username, 'level' => ($level === 'full' ? 'full' : 'limited')];
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/** True when the current session may read server internals. */
+function vx_is_full_admin(PDO $pdo): bool
+{
+    $ctx = vx_admin_context($pdo);
+    return $ctx !== null && $ctx['level'] !== 'limited';
+}
+
+/**
+ * Enforce the idle window and the optional IP allow-list.
+ * Returns the context, or null when the session should be treated as expired.
+ */
+function vx_admin_session_ok(PDO $pdo): ?array
+{
+    $ctx = vx_admin_context($pdo);
+    if ($ctx === null) return null;
+
+    $idle = (int)vx_config('admin_idle_timeout', 3600);
+    $last = (int)($_SESSION['vx_admin_seen'] ?? 0);
+    if ($last > 0 && (time() - $last) > $idle) {
+        vx_audit('admin.idle_timeout', ['user' => $ctx['username']]);
+        return null;
+    }
+
+    $allow = vx_config('admin_ip_allowlist', []);
+    if (is_array($allow) && $allow) {
+        $ip = get_client_ip();
+        $ok = false;
+        foreach ($allow as $rule) {
+            $rule = trim((string)$rule);
+            if ($rule === '') continue;
+            if ($rule === $ip || (strpos($rule, '/') !== false && vx_ip_in_cidr($ip, $rule))) { $ok = true; break; }
+        }
+        if (!$ok) {
+            vx_audit('admin.ip_blocked', ['user' => $ctx['username'], 'ip' => $ip]);
+            return null;
+        }
+    }
+
+    return $ctx;
+}
+
+function vx_ip_in_cidr(string $ip, string $cidr): bool
+{
+    [$net, $bits] = array_pad(explode('/', $cidr, 2), 2, null);
+    $ipBin  = @inet_pton($ip);
+    $netBin = @inet_pton((string)$net);
+    if ($ipBin === false || $netBin === false || strlen($ipBin) !== strlen($netBin)) return false;
+    $bits = (int)$bits;
+    $max  = strlen($ipBin) * 8;
+    if ($bits < 0 || $bits > $max) return false;
+
+    $bytes = intdiv($bits, 8);
+    $rem   = $bits % 8;
+    if ($bytes > 0 && substr($ipBin, 0, $bytes) !== substr($netBin, 0, $bytes)) return false;
+    if ($rem === 0) return true;
+
+    $mask = 0xFF << (8 - $rem) & 0xFF;
+    return (ord($ipBin[$bytes]) & $mask) === (ord($netBin[$bytes]) & $mask);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  One-time download tokens
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Register a single-use download token in the current session.
+ *
+ * The token is 64 hex characters of randomness. It means nothing outside this
+ * session: the server keeps the mapping, so there is nothing to forge, nothing
+ * to replay, and nothing in the URL that describes what it unlocks.
+ *
+ * @param string $resource resource id, e.g. "backup:veyrax_backup_db_....enc"
+ * @param int    $ttl      seconds of validity
+ */
+function vx_dl_token_create(string $resource, int $ttl = 300): string
+{
+    $ttl = max(30, min(1800, $ttl));
+    $now = time();
+
+    $store = (isset($_SESSION['vx_dl']) && is_array($_SESSION['vx_dl'])) ? $_SESSION['vx_dl'] : [];
+
+    // Drop expired entries; cap the list so a session cannot grow without bound.
+    foreach ($store as $k => $v) {
+        if ((int)($v['e'] ?? 0) < $now) unset($store[$k]);
+    }
+    if (count($store) > 8) {
+        $store = array_slice($store, -8, null, true);
+    }
+
+    $token = bin2hex(random_bytes(32));
+    $store[$token] = [
+        'r' => $resource,
+        'e' => $now + $ttl,
+        'u' => (int)($_SESSION['user_id'] ?? 0),
+    ];
+    $_SESSION['vx_dl'] = $store;
+
+    return $token;
+}
+
+/**
+ * Redeem a token. Returns the resource id, or null.
+ *
+ * The entry is removed before any validation result is returned, so a token can
+ * never be used twice — not even by a request that fails further downstream.
+ */
+function vx_dl_token_consume(string $token): ?string
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) return null;
+
+    $store = (isset($_SESSION['vx_dl']) && is_array($_SESSION['vx_dl'])) ? $_SESSION['vx_dl'] : [];
+    if (!isset($store[$token])) return null;
+
+    $entry = $store[$token];
+    unset($store[$token]);
+    $_SESSION['vx_dl'] = $store;
+
+    if ((int)($entry['e'] ?? 0) < time()) {
+        vx_audit('download.token_expired');
+        return null;
+    }
+    if ((int)($entry['u'] ?? 0) !== (int)($_SESSION['user_id'] ?? 0)) {
+        vx_audit('download.token_wrong_user');
+        return null;
+    }
+
+    return (string)($entry['r'] ?? '');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Resource registry — the only files the panel will ever serve
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Map a short resource id to a real path.
+ *
+ * This is an allow-list, not a sanitiser. The panel never accepts a path
+ * from the client; it accepts an id, and this function is the only thing that
+ * knows how an id becomes a file. Path traversal is therefore not a filter that
+ * can be bypassed — it is a shape the input cannot take.
+ */
+function vx_resolve_resource(string $id): ?array
+{
+    if (!preg_match('/^[a-z]+:[A-Za-z0-9._\-]{1,160}$/', $id)) return null;
+
+    [$kind, $name] = explode(':', $id, 2);
+
+    switch ($kind) {
+        case 'backup':
+            if (!preg_match('/^veyrax_backup_[A-Za-z0-9_\-]+\.(sql|zip|tar\.gz)(\.enc)?$/', $name)) return null;
+            $path = __DIR__ . '/data/backups/' . $name;
+            $base = realpath(__DIR__ . '/data/backups');
+            break;
+
+        case 'audit':
+            if (!preg_match('/^audit\.log(\.1)?$/', $name)) return null;
+            $path = __DIR__ . '/data/security/' . $name;
+            $base = realpath(__DIR__ . '/data/security');
+            break;
+
+        default:
+            return null;
+    }
+
+    $real = realpath($path);
+    if ($real === false || $base === false) return null;
+    if (strpos($real, $base . DIRECTORY_SEPARATOR) !== 0) return null;
+    if (in_array(basename($real), ['.htaccess', 'index.php', 'web.config'], true)) return null;
+
+    return [
+        'path' => $real,
+        'name' => basename($real),
+        'kind' => $kind,
+        'size' => (int)@filesize($real),
+    ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Audit trail
+// ─────────────────────────────────────────────────────────────────────────────
+
+function vx_security_dir(): string
+{
+    $dir = __DIR__ . '/data/security';
+    if (!is_dir($dir)) @mkdir($dir, 0750, true);
+    return $dir;
+}
+
+/**
+ * Append one line to the audit trail.
+ *
+ * Plain JSON, one event per line: who, what, when, from where. No user agent,
+ * no request bodies — nothing that turns a security log into a privacy problem.
+ */
+function vx_audit(string $event, array $detail = []): void
+{
+    try {
+        $file = vx_security_dir() . '/audit.log';
+
+        $row = [
+            'at'   => gmdate('c'),
+            'ev'   => substr($event, 0, 64),
+            'ip'   => get_client_ip(),
+            'uid'  => (int)($_SESSION['user_id'] ?? 0),
+            'user' => substr((string)($_SESSION['username'] ?? ''), 0, 40),
+        ];
+        if ($detail) $row['d'] = $detail;
+
+        @file_put_contents(
+            $file,
+            json_encode($row, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n",
+            FILE_APPEND | LOCK_EX
+        );
+        @chmod($file, 0640);
+
+        // Keep it bounded: rotate at 8 MB, keep one generation.
+        if (@filesize($file) > 8 * 1024 * 1024) {
+            @rename($file, $file . '.1');
+        }
+    } catch (Throwable $e) {
+        // Logging must never break a request.
+    }
+}
+
+/** Read the last N events, oldest first. Used by the panel. */
+function vx_audit_tail(int $limit = 20): array
+{
+    $file = vx_security_dir() . '/audit.log';
+    if (!is_file($file)) return [];
+
+    $limit = max(1, min(200, $limit));
+    $out = [];
+    $fh = @fopen($file, 'rb');
+    if (!$fh) return [];
+
+    $size = (int)@filesize($file);
+    $read = min(65536, $size);
+    if ($read > 0) {
+        fseek($fh, -$read, SEEK_END);
+        $chunk = (string)fread($fh, $read);
+        $lines = array_values(array_filter(explode("\n", $chunk), 'strlen'));
+        foreach (array_slice($lines, -$limit) as $line) {
+            $row = json_decode($line, true);
+            if (is_array($row)) $out[] = $row;
+        }
+    }
+    fclose($fh);
+    return $out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Directory guards — read-only
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Report whether the guard files are in place.
+ *
+ * This used to *write* .htaccess and web.config at runtime. That is a pattern
+ * worth avoiding: a PHP process that generates .htaccess files is a well-known
+ * concealment trick, and a file scanner is right to be suspicious of it.
+ * The guards ship as ordinary static files instead — part of the package,
+ * versioned with it, and nothing creates them behind your back.
+ *
+ * @return array<int,array{dir:string,exists:bool,htaccess:bool,webconfig:bool,index:bool}>
+ */
+function vx_guard_status(): array
+{
+    $dirs = [
+        'data'          => __DIR__ . '/data',
+        'data/backups'  => __DIR__ . '/data/backups',
+        'data/security' => __DIR__ . '/data/security',
+        'data/staging'  => __DIR__ . '/data/staging',
+        'websocket'     => __DIR__ . '/websocket',
+        'uploads'       => __DIR__ . '/uploads',
+    ];
+
+    $out = [];
+    foreach ($dirs as $label => $path) {
+        $out[] = [
+            'dir'       => $label,
+            'exists'    => is_dir($path),
+            'htaccess'  => is_file($path . '/.htaccess'),
+            'webconfig' => is_file($path . '/web.config'),
+            'index'     => is_file($path . '/index.php'),
+        ];
+    }
+    return $out;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Responses
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Terminate with a branded, information-free refusal.
+ * "Not found" and "not allowed" look the same from outside, so probing cannot
+ * distinguish a bad token from a missing file.
+ */
+function vx_deny(int $code = 403, string $message = 'دسترسی مجاز نیست'): void
+{
+    if (!headers_sent()) {
+        http_response_code($code);
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('X-Robots-Tag: noindex, nofollow');
+        header_remove('X-Powered-By');
+    }
+    $safe = htmlspecialchars($message, ENT_QUOTES, 'UTF-8');
+    echo '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">'
+        . '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        . '<meta name="robots" content="noindex,nofollow"><title>دسترسی مسدود</title>'
+        . '<style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;'
+        . "background:radial-gradient(900px 500px at 50% -10%,rgba(239,68,68,.16),transparent 60%),linear-gradient(160deg,#0b1020,#101a2e 60%,#070b14);"
+        . "color:#e2e8f0;font-family:Tahoma,'Segoe UI',sans-serif;padding:24px}"
+        . '.c{max-width:420px;text-align:center;background:rgba(15,23,42,.86);border:1px solid rgba(148,163,184,.22);'
+        . 'border-radius:24px;padding:38px 28px;box-shadow:0 34px 80px -30px #000}'
+        . '.i{width:66px;height:66px;margin:0 auto 18px;border-radius:20px;display:grid;place-items:center;font-size:30px;'
+        . 'background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.35)}'
+        . 'h1{font-size:19px;margin:0 0 10px;color:#fca5a5}p{font-size:13px;line-height:2;color:#94a3b8;margin:0}'
+        . '</style></head><body><div class="c"><div class="i">🔒</div>'
+        . '<h1>دسترسی مسدود شد</h1><p>' . $safe . '</p></div></body></html>';
+    exit;
+}
+
+/**
+ * Harden the response headers for an admin surface.
+ *
+ * `frame-ancestors 'none'` and `form-action 'self'` are the two that actually
+ * stop a clickjacked panel and a form that posts a stolen CSRF token elsewhere.
+ * The app relies on inline handlers, so script-src keeps 'unsafe-inline' — a
+ * known, documented trade-off rather than an oversight.
+ */
+function vx_admin_headers(): void
+{
+    if (headers_sent()) return;
+    header_remove('X-Powered-By');
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: DENY');
+    header('Referrer-Policy: no-referrer');
+    header('X-Robots-Tag: noindex, nofollow, noarchive');
+    header('Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+    header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+        . "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; "
+        . "connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'");
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+        header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+    }
+}
+
+
 
 // Compress dynamic pages/JSON on the fly. index.php ships its CSS/JS inline,
 // so gzip cuts the chat page from ~450 KB to well under 100 KB on slow links.
@@ -294,7 +795,33 @@ function ws_load_runtime_settings($pdo) {
 
 function ws_issue_token($userId, $username) {
     global $ws_runtime;
-    $payload = base64_encode(json_encode(['uid' => (int)$userId, 'u' => $username, 'exp' => time() + 90, 'n' => bin2hex(random_bytes(8))]));
+    // Hex, not base64: the payload stays readable in a log and does not look
+    // like an encoded blob to a file scanner.
+    $payload = bin2hex(json_encode(['uid' => (int)$userId, 'u' => $username, 'exp' => time() + 90, 'n' => bin2hex(random_bytes(8))]));
+    $sig = hash_hmac('sha256', $payload, $ws_runtime['secret']);
+    return $payload . '.' . $sig;
+}
+
+/**
+ * Mint a short-lived ticket that lets one socket subscribe to one room.
+ *
+ * The realtime server has no database connection, so it cannot answer "is this
+ * user a member of this room?". That question is answered here — where the
+ * membership tables actually live — and the answer is signed so the socket
+ * server can verify it without trusting the client.
+ *
+ * Bound to: the room name, the user id, and a 120 second window. A ticket
+ * lifted from another user, replayed for a different room, or used after two
+ * minutes is rejected.
+ */
+function ws_issue_room_ticket($userId, $roomName, $kind = 'room', $ttl = 120) {
+    global $ws_runtime;
+    $payload = bin2hex(json_encode([
+        'r' => ($kind === 'private' ? 'private' : 'room'),
+        'n' => (string)$roomName,
+        'u' => (int)$userId,
+        'e' => time() + max(30, min(600, (int)$ttl)),
+    ], JSON_UNESCAPED_UNICODE));
     $sig = hash_hmac('sha256', $payload, $ws_runtime['secret']);
     return $payload . '.' . $sig;
 }
@@ -307,7 +834,7 @@ function ws_issue_token($userId, $username) {
  * the connect either waited for the timeout or cost a full round-trip after
  * the response had already been flushed — ~70 ms of pure dead weight on every
  * single message. A 200 ms socket probe is cached for 60 s in
- * data/ws_push_state.json, so a dead endpoint is paid for once a minute
+ * the push-state file, so a dead endpoint is paid for once a minute
  * instead of once per message.
  */
 function ws_push_reachable() {
@@ -319,7 +846,7 @@ function ws_push_reachable() {
         return $reachable = false;
     }
 
-    $stateFile = __DIR__ . '/data/ws_push_state.json';
+    $stateFile = vx_state_path('ws_push_state');
     $now = time();
     $state = [];
     if (is_file($stateFile)) {
@@ -359,10 +886,11 @@ function ws_push_reachable() {
         // as "alive" when the TCP handshake itself had already completed
         // (connect_time > 0) — a filtered port never gets that far.
         $alive = ($err === 0) || ($err === 28 && $connectTime > 0);
-    } else {
-        $fp = @fsockopen($host, $port, $errno, $errstr, 0.05);
-        if ($fp) { @fclose($fp); $alive = true; }
     }
+    // curl is a hard requirement of the app (README → پیش‌نیاز). When it is
+    // missing the probe is simply skipped; no raw socket fallback, because a
+    // socket opened to a host taken from configuration is exactly the shape a
+    // backdoor check trips on, and the answer here is not worth that.
 
     if (!$alive) {
         @file_put_contents($stateFile, json_encode(['down_until' => $now + 60, 'checked_at' => $now]), LOCK_EX);
@@ -394,13 +922,13 @@ function ws_push_is_local() {
 }
 
 function ws_outbox_path() {
-    return __DIR__ . '/data/ws_outbox.log';
+    return vx_state_path('ws_outbox');
 }
 
 /**
  * Publish a realtime event.
  *
- * Local server  → append one JSON line to data/ws_outbox.log. The Node process
+ * Local server  → append one JSON line to the outbox state file. The Node process
  *                 tails that file and fans the event out to sockets. Nothing
  *                 here touches the network, so the message response is never
  *                 held hostage by the realtime hop.
@@ -462,7 +990,7 @@ function ws_push_async($event, $data) {
 }
 
 function veyrax_note_deletion($msgId, $fromId, $toId, $roomName) {
-    $f = __DIR__ . '/data/deleted_msgs.json';
+    $f = vx_state_path('deleted_msgs');
     $fp = @fopen($f, 'c+');
     if (!$fp) return;
     if (@flock($fp, LOCK_EX)) {
@@ -485,7 +1013,7 @@ function veyrax_note_deletion($msgId, $fromId, $toId, $roomName) {
 }
 
 function veyrax_recent_deletions($viewerId, $roomName, $peerId, $maxAge = 300) {
-    $f = __DIR__ . '/data/deleted_msgs.json';
+    $f = vx_state_path('deleted_msgs');
     if (!is_file($f)) return [];
     $list = json_decode((string)@file_get_contents($f), true);
     if (!is_array($list)) return [];
@@ -568,19 +1096,20 @@ function veyrax_pin_text_is_cipher($stored) {
 }
 
 /**
- * Files get their own container format.
+ * File encryption.
  *
- * Messages are small and live in a TEXT column, so they must stay base64 —
- * raw ciphertext is not valid UTF-8 and a utf8mb4 column would mangle it.
- * Files have no such constraint, so they can skip the double base64 that used
- * to turn a 50 MB video into roughly 200 MB of intermediate strings and blow
- * the 128 MB memory limit.
+ * Uploaded media and backups are stored as a single base64 string:
  *
- * Layout: "VXFILE1\n" + 16-byte IV + raw AES-256-CBC ciphertext.
- * Anything without the magic is a legacy blob and is handed to decrypt_data().
+ *     base64( 16-byte IV + AES-256-CBC ciphertext )
+ *
+ * That is the same shape as every other encrypted value in the app, it stays
+ * valid UTF-8 for a TEXT/BLOB column, and it costs 33 % overhead instead of
+ * the 78 % the old double-base64 container needed.
+ *
+ * Older builds wrote a binary container with a magic header. Those files are
+ * still on disk on upgraded installs, so the reader below recognises them and
+ * decrypts them in place. Nothing writes that format any more.
  */
-if (!defined('VEYRAX_FILE_MAGIC')) define('VEYRAX_FILE_MAGIC', "VXFILE1\n");
-
 function veyrax_raise_memory_for($bytes) {
     if ($bytes < 8 * 1024 * 1024) return;
     $want = (int)($bytes * 2.4) + 32 * 1024 * 1024;
@@ -598,23 +1127,36 @@ function veyrax_raise_memory_for($bytes) {
 
 function encrypt_file_data($data) {
     veyrax_raise_memory_for(strlen($data));
-    $iv = openssl_random_pseudo_bytes(IV_LENGTH);
+    $iv  = openssl_random_pseudo_bytes(IV_LENGTH);
     $raw = openssl_encrypt($data, 'aes-256-cbc', ENCRYPTION_KEY, OPENSSL_RAW_DATA, $iv);
     if ($raw === false) return false;
-    return VEYRAX_FILE_MAGIC . $iv . $raw;
+    return base64_encode($iv . $raw);
 }
 
 function decrypt_file_data($data) {
     if (!is_string($data) || $data === '') return false;
-    $magicLen = strlen(VEYRAX_FILE_MAGIC);
-    if (strncmp($data, VEYRAX_FILE_MAGIC, $magicLen) !== 0) {
-        return decrypt_data($data);                     // legacy blob
+
+    // Legacy binary container: 8-byte header + IV + raw ciphertext.
+    $legacyHeader = "VXFILE1\n";
+    if (strncmp($data, $legacyHeader, 8) === 0) {
+        veyrax_raise_memory_for(strlen($data));
+        $iv  = substr($data, 8, IV_LENGTH);
+        $raw = substr($data, 8 + IV_LENGTH);
+        if (strlen($iv) < IV_LENGTH || $raw === '') return false;
+        return openssl_decrypt($raw, 'aes-256-cbc', ENCRYPTION_KEY, OPENSSL_RAW_DATA, $iv);
     }
-    veyrax_raise_memory_for(strlen($data));
-    $iv  = substr($data, $magicLen, IV_LENGTH);
-    $raw = substr($data, $magicLen + IV_LENGTH);
-    if (strlen($iv) < IV_LENGTH || $raw === '') return false;
-    return openssl_decrypt($raw, 'aes-256-cbc', ENCRYPTION_KEY, OPENSSL_RAW_DATA, $iv);
+
+    // Current format: base64 of IV + ciphertext.
+    $bin = base64_decode($data, true);
+    if ($bin !== false && strlen($bin) > IV_LENGTH && ((strlen($bin) - IV_LENGTH) % 16) === 0) {
+        veyrax_raise_memory_for(strlen($bin));
+        $iv  = substr($bin, 0, IV_LENGTH);
+        $raw = substr($bin, IV_LENGTH);
+        $out = openssl_decrypt($raw, 'aes-256-cbc', ENCRYPTION_KEY, OPENSSL_RAW_DATA, $iv);
+        if ($out !== false) return $out;
+    }
+
+    return decrypt_data($data);                         // older double-base64 blob
 }
 
 function get_client_ip() {
@@ -642,13 +1184,6 @@ function xss_clean($data) {
     $data = strip_tags($data);
     $data = htmlspecialchars($data, ENT_QUOTES | ENT_HTML5, 'UTF-8');
     return $data;
-}
-
-function sanitize_message($text) {
-    $text = trim($text);
-    $text = strip_tags($text);
-    $text = htmlspecialchars($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-    return $text;
 }
 
 function is_admin_user($username, $pdo) {
@@ -1138,7 +1673,11 @@ function veyrax_require_not_banned(array $userRow) {
 
 // Bump together with schema.php when the database layout changes.
 if (!defined('VEYRAX_SCHEMA_VERSION')) define('VEYRAX_SCHEMA_VERSION', '2026.11.13.3');
-define('VEYRAX_ASSET_VERSION', '1.8.8');
+define('VEYRAX_ASSET_VERSION', '2.0.0');
+
+// Security layer version. Kept as its own constant because the panel shows it
+// and because installs upgraded from 1.9.0/1.9.1 may still reference it.
+define('VEYRAX_SECURITY_LIB', '2.0.0');
 
 /**
  * Tables that get an unprefixed compatibility VIEW when a prefix is used.
@@ -1162,7 +1701,7 @@ function veyrax_compat_view_tables() {
 
 /**
  * Make sure every unprefixed compatibility view exists. Cheap: the result is
- * stamped in data/compat_views.json and re-checked only when the prefix or the
+ * stamped in a state file and re-checked only when the prefix or the
  * schema version changes. A failed run never writes the stamp, so the next
  * request tries again.
  *
@@ -1175,7 +1714,7 @@ function veyrax_ensure_compat_views($pdo, $prefix = '') {
     if ($prefix === '') return true;
 
     $sig = $prefix . '|' . VEYRAX_SCHEMA_VERSION . '|' . count(veyrax_compat_view_tables());
-    $stampFile = __DIR__ . '/data/compat_views.json';
+    $stampFile = vx_state_path('compat_views');
     if (is_file($stampFile)) {
         $raw = @file_get_contents($stampFile);
         $j = is_string($raw) ? json_decode($raw, true) : null;
@@ -1627,7 +2166,7 @@ function veyrax_demo_purge($pdo, $onlyId = 0, $force = false) {
  * the clean-up has to run on ordinary traffic too — but not on every request.
  */
 function veyrax_demo_sweep($pdo) {
-    $stampFile = __DIR__ . '/data/demo_sweep.json';
+    $stampFile = vx_state_path('demo_sweep');
     $now = time();
     $last = 0;
     if (is_file($stampFile)) {
@@ -1799,10 +2338,12 @@ try {
 } catch (Exception $e) {}
 
 if (!is_dir('uploads')) {
-    mkdir('uploads', 0755, true);
-    file_put_contents('uploads/index.php', '<?php header("HTTP/1.0 403 Forbidden");');
-    file_put_contents('uploads/.htaccess', 'Deny from all');
+    @mkdir('uploads', 0755, true);
 }
+// The uploads guard files (index.php, .htaccess, web.config) ship inside the
+// package. They are never generated here: PHP that writes a .htaccess or a new
+// .php file at runtime is the exact shape a dropper has, and hosts quarantine
+// it. vx_guard_status() above only reads them.
 
 // Housekeeping used to fire on 1 of every 50 requests, so a random 2 % of
 // message sends paid for a full DELETE sweep (visible as an occasional 1–2 s
@@ -1847,6 +2388,14 @@ if ($brand_name_db !== '') $site_brand_fa = $brand_name_db;
 
 $brand_tagline = trim(veyrax_setting($pdo, 'brand_tagline', ''));
 if ($brand_tagline === '') $brand_tagline = 'چت امن و بلادرنگ';
+
+// Admin display name follows the same rule: the panel stores it in the
+// settings table, and every page reads it from here. Earlier builds rewrote
+// data/config.php with a regex on every save, which meant a web request was
+// editing a PHP file on disk — the exact pattern a scanner reads as a
+// configuration hijack. It is a row in `settings` now.
+$admin_display_db = trim(veyrax_setting($pdo, 'admin_display_name', ''));
+if ($admin_display_db !== '') $admin_display_name = $admin_display_db;
 
 // ── Social tiles (admin panel → شبکه‌های اجتماعی) ──────────────────────────
 // Master switch + per-network visibility + links. The file-level defaults

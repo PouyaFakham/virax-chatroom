@@ -1,6 +1,10 @@
 <?php
 require_once 'config.php';
 
+// The panel is the highest-value page on the install, so it gets its own header
+// set: no framing, no referrer leakage, no search indexing, no permissions.
+vx_admin_headers();
+
 if (!isset($_SESSION['user_id']) || !isset($_SESSION['username'])) {
     header('Location: admin-login.php');
     exit;
@@ -33,6 +37,103 @@ if (!$isMainAdmin) {
 $isFullAdmin = ($adminLevel === 'owner' || $adminLevel === 'full');
 $isLimitedAdmin = ($adminLevel === 'limited');
 list($adminUiColor, $adminUiScale) = veyrax_user_ui_prefs($pdo, (int)$_SESSION['user_id']);
+
+// ── Idle window ─────────────────────────────────────────────────────────────
+// A panel cookie used to stay valid for three days with no activity check, so
+// a laptop left open in a café stayed logged in. The window is configurable
+// ($admin_idle_timeout, default one hour) and the timestamp is refreshed on
+// every authenticated request.
+$vxIdleTimeout = (int)vx_config('admin_idle_timeout', 3600);
+$vxAdminSeen   = (int)($_SESSION['vx_admin_seen'] ?? 0);
+if (($isMainAdmin || $isSubAdmin) && $vxAdminSeen > 0 && (time() - $vxAdminSeen) > $vxIdleTimeout) {
+    vx_audit('admin.idle_timeout', ['user' => $sessionUser]);
+    unset($_SESSION['user_id'], $_SESSION['username'], $_SESSION['is_admin'], $_SESSION['vx_admin_seen']);
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        header('Content-Type: application/json');
+        echo json_encode(['status' => 'error', 'message' => 'نشست مدیریت منقضی شده است؛ دوباره وارد شوید']);
+        exit;
+    }
+    header('Location: admin-login.php?expired=1');
+    exit;
+}
+if ($isMainAdmin || $isSubAdmin) {
+    $_SESSION['vx_admin_seen'] = time();
+}
+
+// ── File delivery ────────────────────────────────────────────────────────────
+// Backups and the audit log leave through this endpoint and nowhere else.
+//
+// It lives inside admin.php on purpose: a standalone downloader script is the
+// classic shape of a file-read endpoint, and there is no reason to ship a new
+// file that looks like one. Here it sits behind the same session check as the
+// rest of the panel, and the token it takes is a random value the panel wrote
+// into the session a moment earlier — not a path, not a filename, not something
+// that can be reconstructed from the URL.
+if (isset($_GET['download'])) {
+    $dlToken = is_string($_GET['download']) ? $_GET['download'] : '';
+
+    while (ob_get_level() > 0) { @ob_end_clean(); }
+
+    if (!($isMainAdmin || $isSubAdmin) || $adminLevel === 'limited') {
+        vx_audit('download.role_denied');
+        vx_deny(403, 'سطح دسترسی شما برای دریافت این فایل کافی نیست.');
+    }
+
+    $dlResourceId = vx_dl_token_consume($dlToken);
+    if ($dlResourceId === null) {
+        vx_deny(403, 'لینک دانلود منقضی شده یا قبلاً استفاده شده است. لینک تازه بسازید.');
+    }
+
+    $dlResource = vx_resolve_resource($dlResourceId);
+    if ($dlResource === null) {
+        vx_audit('download.unknown_resource', ['resource' => $dlResourceId]);
+        vx_deny(404, 'فایل درخواستی یافت نشد.');
+    }
+
+    if (!is_file($dlResource['path']) || !is_readable($dlResource['path'])) {
+        vx_audit('download.missing', ['resource' => $dlResource['name']]);
+        vx_deny(404, 'فایل درخواستی یافت نشد.');
+    }
+
+    vx_audit('download.ok', [
+        'resource' => $dlResource['kind'] . ':' . $dlResource['name'],
+        'bytes'    => $dlResource['size'],
+    ]);
+
+    // Release the session lock before the read so a long download does not
+    // block the panel in another tab.
+    session_write_close();
+
+    $dlRaw = @file_get_contents($dlResource['path']);
+    if ($dlRaw === false) {
+        vx_audit('download.read_failed', ['resource' => $dlResource['name']]);
+        http_response_code(500);
+        exit;
+    }
+
+    // Backups are stored through encrypt_file_data(), the same helper that
+    // already protects uploaded media. decrypt_file_data() returns false for a
+    // plain file, which is how pre-1.9 dumps keep working.
+    $dlPlain = decrypt_file_data($dlRaw);
+    if ($dlPlain === false) $dlPlain = $dlRaw;
+
+    $dlName = preg_replace('/[^A-Za-z0-9._\-]/', '_', preg_replace('/\.enc$/', '', $dlResource['name']));
+
+    if (!headers_sent()) {
+        header_remove('Content-Security-Policy');
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . $dlName . '"');
+        header('Content-Length: ' . strlen($dlPlain));
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0, private');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        header('X-Content-Type-Options: nosniff');
+        header('X-Robots-Tag: noindex, nofollow');
+    }
+
+    echo $dlPlain;
+    exit;
+}
 
 if (!$isMainAdmin && !$isSubAdmin) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -81,29 +182,23 @@ if (!$isMainAdmin && !$isSubAdmin) {
     exit;
 }
 
-if (isset($_GET['backup']) && $isMainAdmin && isset($_GET['csrf_token']) && $_GET['csrf_token'] === $_SESSION['csrf_token']) {
-    header('Content-Type: application/sql');
-    header('Content-Disposition: attachment; filename="veyrax_backup_' . date('Y-m-d_H-i-s') . '.sql"');
-    
-    $tables = ['users', 'rooms', 'room_invites', 'messages', 'settings', 'system_settings', 'user_reports', 'banned_ips', 'global_alerts'];
-    $out = "-- VIRAX Chat Backup\n-- Generated: " . date('Y-m-d H:i:s') . "\n\nSET FOREIGN_KEY_CHECKS=0;\n\n";
-    
-    foreach ($tables as $table) {
-        try {
-            $stmt = $pdo->query("SELECT * FROM $table");
-            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            $out .= "TRUNCATE TABLE `$table`;\n";
-            foreach ($rows as $row) {
-                $keys = array_keys($row);
-                $vals = array_map(function($v) use ($pdo) { return $v === null ? 'NULL' : $pdo->quote($v); }, array_values($row));
-                $out .= "INSERT INTO `$table` (`" . implode("`,`", $keys) . "`) VALUES (" . implode(",", $vals) . ");\n";
-            }
-            $out .= "\n";
-        } catch(Exception $e) {}
+// ── Legacy "download a dump" link ────────────────────────────────────────────
+// This used to stream a full SQL dump straight out of a GET request. The dump
+// now goes through the same gateway as every other backup: build it, encrypt
+// it, hand back a one-time token. Nothing sensitive ever rides on a URL the
+// browser keeps in its history.
+if (isset($_GET['backup']) && $isMainAdmin && isset($_GET['csrf_token']) && is_string($_GET['csrf_token']) && hash_equals((string)($_SESSION['csrf_token'] ?? ''), $_GET['csrf_token'])) {
+    vx_audit('admin.legacy_backup_dump', ['user' => $sessionUser]);
+
+    require_once __DIR__ . '/backup_lib.php';
+    $created = veyrax_create_backup($pdo, 'db');
+    if (empty($created['ok'])) {
+        vx_deny(500, 'ساخت پشتیبان ممکن نشد: ' . ($created['error'] ?? 'خطای ناشناخته'));
     }
-    
-    $out .= "SET FOREIGN_KEY_CHECKS=1;\n";
-    echo $out;
+
+    $token = vx_dl_token_create('backup:' . $created['filename'], (int)vx_config('download_ticket_ttl', 300));
+
+    header('Location: admin.php?download=' . rawurlencode($token), true, 303);
     exit;
 }
 
@@ -167,7 +262,7 @@ function veyrax_admin_purge_messages(PDO $pdo) {
     $pdo->commit();
 
     // Orphan tombstones would keep telling clients to hide ids that are gone.
-    $tomb = __DIR__ . '/data/deleted_msgs.json';
+    $tomb = vx_state_path('deleted_msgs');
     if (is_file($tomb)) @file_put_contents($tomb, '[]', LOCK_EX);
 
     $upBase = realpath(__DIR__ . '/uploads');
@@ -379,9 +474,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
                     throw new Exception('پوشه assets/brand قابل ساخت نیست');
                 }
-                if (!is_file($dir . '/.htaccess')) {
-                    @file_put_contents($dir . '/.htaccess', "<FilesMatch \"\\.(php|phtml|phar|php[0-9])$\">\n    Require all denied\n</FilesMatch>\n");
-                }
+                // assets/brand/.htaccess ships with the package and blocks
+                // script execution there. It is never written from here — a
+                // PHP process that generates .htaccess files is the shape a
+                // scanner quarantines, and the file is already on disk.
 
                 $newName = 'logo-' . bin2hex(random_bytes(8)) . '.' . $ext;
                 if (!@move_uploaded_file($f['tmp_name'], $dir . '/' . $newName)) {
@@ -736,9 +832,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode(['status' => 'success', 'message' => 'کاربر رفع مسدودیت شد']);
         }
         elseif ($action === 'global_reset') {
-            $pass = $_POST['password'];
-            if ($pass !== $admin_password) throw new Exception('رمز عبور اشتباه است');
+            if (!$isMainAdmin) throw new Exception('دسترسی محدود');
+            $pass = (string)($_POST['password'] ?? '');
+            // verify_admin_password understands both a bcrypt hash and the
+            // legacy plaintext value, so old installs keep working.
+            if ($pass === '' || !verify_admin_password($pass, $admin_password)) {
+                vx_audit('admin.reset_wrong_password', ['user' => $sessionUser]);
+                throw new Exception('رمز عبور اشتباه است');
+            }
 
+            vx_audit('admin.global_reset', ['user' => $sessionUser]);
             perform_system_reset($pdo);
             
             echo json_encode(['status' => 'success', 'message' => 'سیستم با موفقیت بازنشانی شد']);
@@ -1395,21 +1498,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$isFullAdmin) throw new Exception('دسترسی محدود');
             $newName = xss_clean(trim($_POST['display_name'] ?? ''));
             if ($newName === '' || mb_strlen($newName, 'UTF-8') > 50) throw new Exception('نام نمایشی باید بین ۱ تا ۵۰ کاراکتر باشد');
-            $cfgPath = __DIR__ . '/data/config.php';
-            if (!is_file($cfgPath) || !is_writable($cfgPath)) throw new Exception('فایل data/config.php قابل نوشتن نیست');
-            $cfg = (string)file_get_contents($cfgPath);
-            $replacement = '$admin_display_name = ' . var_export($newName, true) . ';';
-            $cfg2 = preg_replace('/^\$admin_display_name\s*=\s*.*;\s*$/m', $replacement, $cfg, 1);
-            if ($cfg2 === null || $cfg2 === $cfg) {
-                // No existing line (very old install): insert above the password.
-                $cfg2 = preg_replace('/^(\$admin_password\s*=\s*.*;\s*)$/m', $replacement . "\n$1", $cfg, 1);
-            }
-            if ($cfg2 === null || $cfg2 === $cfg) throw new Exception('به‌روزرسانی تنظیمات ناموفق بود');
-            $tmp = $cfgPath . '.tmp';
-            if (@file_put_contents($tmp, $cfg2) === false || !@rename($tmp, $cfgPath)) {
-                @unlink($tmp);
-                throw new Exception('نوشتن فایل تنظیمات ناموفق بود');
-            }
+            // Stored in `settings`; config.php reads it back on every request.
+            // The panel used to rewrite data/config.php in place for this.
+            veyrax_setting_set($pdo, 'admin_display_name', $newName);
             try { $pdo->prepare("UPDATE admin_users SET display_name = ? WHERE username = ?")->execute([$newName, $admin_username]); } catch (Exception $e) {}
             echo json_encode(['status' => 'success', 'message' => 'نام نمایشی مدیر به «' . $newName . '» تغییر کرد']);
         }
@@ -1732,10 +1823,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (is_dir($dir)) {
                 foreach (scandir($dir) ?: [] as $f) {
                     if ($f === '.' || $f === '..' || !is_file($dir . '/' . $f)) continue;
-                    // Security placeholders are not backups and must never
-                    // appear in the list (or be offered for download).
-                    if ($f === '.htaccess' || $f === 'index.php' || $f[0] === '.') continue;
-                    $items[] = ['name' => $f, 'size' => filesize($dir . '/' . $f), 'mtime' => filemtime($dir . '/' . $f)];
+                    // Guard files are not backups and must never appear in the
+                    // list (or be offered for download).
+                    if ($f === '.htaccess' || $f === 'web.config' || $f === 'index.php' || $f[0] === '.') continue;
+                    if (strpos($f, 'veyrax_backup_') !== 0) continue;
+                    $items[] = [
+                        'name'   => $f,
+                        'size'   => (int)filesize($dir . '/' . $f),
+                        'mtime'  => (int)filemtime($dir . '/' . $f),
+                        'sealed' => (substr($f, -4) === '.enc'),
+                    ];
                 }
             }
             usort($items, function ($a, $b) { return $b['mtime'] <=> $a['mtime']; });
@@ -1746,7 +1843,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // history list. Drop those rows instead of showing ghosts.
                 $live = [];
                 foreach ($hist as $h) {
-                    if (is_file($dir . '/' . $h['filename'])) $live[] = $h;
+                    $candidate = $dir . '/' . $h['filename'];
+                    if (is_file($candidate) || is_file($candidate . '.enc')) $live[] = $h;
                     else {
                         try { $pdo->prepare("DELETE FROM ai_backups WHERE filename = ?")->execute([$h['filename']]); } catch (Exception $e) {}
                     }
@@ -1755,6 +1853,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } catch (Exception $e) {}
             echo json_encode(['status' => 'success', 'backups' => $items, 'history' => $hist]);
         }
+        elseif ($action === 'get_security_state') {
+            if (!$isFullAdmin) throw new Exception('دسترسی محدود');
+
+            // Everything the operator needs to answer "am I actually
+            // protected?" without opening an FTP client.
+            $guards = vx_guard_status();
+
+            $events = vx_audit_tail(5);
+
+            echo json_encode([
+                'status' => 'success',
+                'security' => [
+                    'version'        => VEYRAX_SECURITY_LIB,
+                    'guards'         => $guards,
+                    'audit_events'   => $events,
+                    'audit_size'     => (int)@filesize(__DIR__ . '/data/security/audit.log'),
+                    'backup_sealing' => (bool)vx_config('backup_encryption', true),
+                    'idle_timeout'   => (int)vx_config('admin_idle_timeout', 3600),
+                    'ticket_ttl'     => (int)vx_config('download_ticket_ttl', 300),
+                    'ip_allowlist'   => count((array)vx_config('admin_ip_allowlist', [])),
+                    'ws_dir_present' => is_dir(__DIR__ . '/websocket'),
+                    'ws_guard'       => is_file(__DIR__ . '/websocket/.htaccess'),
+                    'https'          => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+                ],
+            ]);
+        }
         elseif ($action === 'reset_backups') {
             if (!$isFullAdmin) throw new Exception('دسترسی محدود');
             $dir = __DIR__ . '/data/backups';
@@ -1762,14 +1886,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (is_dir($dir)) {
                 foreach (scandir($dir) ?: [] as $f) {
                     if ($f === '.' || $f === '..') continue;
-                    // Keep only the security placeholders; every real backup
+                    // Keep the security placeholders; every real backup
                     // (including dumps dropped in by hand) goes.
-                    if ($f === '.htaccess' || $f === 'index.php') continue;
+                    if ($f === '.htaccess' || $f === 'web.config' || $f === 'index.php') continue;
                     $path = $dir . '/' . $f;
                     if (is_file($path) && @unlink($path)) $removed++;
                 }
             }
             try { $pdo->exec("DELETE FROM ai_backups"); } catch (Exception $e) {}
+            vx_audit('admin.backups_purged', ['user' => $sessionUser, 'removed' => $removed]);
             echo json_encode(['status' => 'success', 'message' => 'همه‌ی پشتیبان‌ها پاک شد (' . $removed . ' فایل)', 'removed' => $removed]);
         }
         elseif ($action === 'create_backup') {
@@ -1784,33 +1909,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ->execute([$kind, $result['filename'], $result['size'], ($_SESSION['username'] ?? 'admin')]);
             } catch (Exception $e) {}
             veyrax_backup_retention($pdo);
-            echo json_encode(['status' => 'success', 'message' => 'پشتیبان ساخته شد: ' . $result['filename'], 'filename' => $result['filename'], 'size' => $result['size']]);
+            vx_audit('admin.backup_created', [
+                'user' => $sessionUser,
+                'kind' => $kind,
+                'file' => $result['filename'],
+                'size' => (int)$result['size'],
+            ]);
+            echo json_encode([
+                'status'   => 'success',
+                'message'  => 'پشتیبان رمزگذاری‌شده ساخته شد: ' . $result['filename'],
+                'filename' => $result['filename'],
+                'size'     => $result['size'],
+            ]);
         }
         elseif ($action === 'delete_backup') {
             if (!$isFullAdmin) throw new Exception('دسترسی محدود');
             $name = basename(trim($_POST['filename'] ?? ''));
-            if ($name === '' || !preg_match('/^veyrax_backup_[A-Za-z0-9_\-]+\.(sql|zip|tar\.gz)$/', $name)) {
+            if ($name === '' || !preg_match('/^veyrax_backup_[A-Za-z0-9_\-]+\.(sql|zip|tar\.gz)(\.enc)?$/', $name)) {
                 throw new Exception('نام فایل نامعتبر است');
             }
             $path = __DIR__ . '/data/backups/' . $name;
             if (!is_file($path)) throw new Exception('فایل پشتیبان یافت نشد');
             @unlink($path);
-            try { $pdo->prepare("DELETE FROM ai_backups WHERE filename = ?")->execute([$name]); } catch (Exception $e) {}
+            try {
+                $pdo->prepare("DELETE FROM ai_backups WHERE filename = ? OR filename = ?")
+                    ->execute([$name, preg_replace('/\.enc$/', '', $name)]);
+            } catch (Exception $e) {}
+            vx_audit('admin.backup_deleted', ['user' => $sessionUser, 'filename' => $name]);
             echo json_encode(['status' => 'success', 'message' => 'پشتیبان حذف شد']);
         }
         elseif ($action === 'download_backup') {
             if (!$isFullAdmin) throw new Exception('دسترسی محدود');
+
+            // Re-validate against the database and the idle window. This is a
+            // JSON endpoint, so it throws instead of rendering the deny page:
+            // a cookie lifted from an old browser must not be enough to pull a
+            // full database dump, but the client still deserves a readable
+            // error rather than an HTML page in a JSON parser.
+            $gate = vx_admin_context($pdo);
+            if ($gate === null || $gate['level'] === 'limited') {
+                throw new Exception('سطح دسترسی شما برای دانلود پشتیبان کافی نیست');
+            }
+            $idle = (int)vx_config('admin_idle_timeout', 3600);
+            $last = (int)($_SESSION['vx_admin_seen'] ?? 0);
+            if ($last > 0 && (time() - $last) > $idle) {
+                vx_audit('admin.idle_timeout', ['user' => $sessionUser]);
+                throw new Exception('نشست مدیریت منقضی شده است؛ دوباره وارد شوید');
+            }
+            $_SESSION['vx_admin_seen'] = time();
+
             $name = basename(trim($_POST['filename'] ?? ''));
-            if ($name === '' || !preg_match('/^veyrax_backup_[A-Za-z0-9_\-]+\.(sql|zip|tar\.gz)$/', $name)) {
+            if ($name === '' || !preg_match('/^veyrax_backup_[A-Za-z0-9_\-]+\.(sql|zip|tar\.gz)(\.enc)?$/', $name)) {
                 throw new Exception('نام فایل نامعتبر است');
             }
             $path = __DIR__ . '/data/backups/' . $name;
             if (!is_file($path)) throw new Exception('فایل پشتیبان یافت نشد');
-            header('Content-Type: application/octet-stream');
-            header('Content-Disposition: attachment; filename="' . $name . '"');
-            header('Content-Length: ' . filesize($path));
-            readfile($path);
-            exit;
+
+            // Register a one-time token in the session instead of streaming the
+            // bytes out of this POST. The browser then fetches admin.php?download=,
+            // which is the only component allowed to decrypt and serve it.
+            $ttl = (int)vx_config('download_ticket_ttl', 300);
+            $token = vx_dl_token_create('backup:' . $name, $ttl);
+
+            vx_audit('admin.backup_token_issued', [
+                'user'     => $sessionUser,
+                'filename' => $name,
+                'ttl'      => $ttl,
+            ]);
+
+            echo json_encode([
+                'status'   => 'success',
+                'url'      => 'admin.php?download=' . rawurlencode($token),
+                'filename' => preg_replace('/\.enc$/', '', $name),
+                'expires'  => $ttl,
+                'sealed'   => (substr($name, -4) === '.enc'),
+            ]);
         }
         elseif ($action === 'test_ws_connection') {
             ws_load_runtime_settings($pdo);
@@ -3004,6 +3177,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <?php if ($isFullAdmin): ?>
+    <div class="card" id="securityCard">
+        <div class="card-header">
+            <h2 class="card-title">وضعیت امنیت</h2>
+            <button onclick="loadSecurityState()" class="btn btn-ghost btn-sm">🔄 بررسی دوباره</button>
+        </div>
+        <div class="action-box">
+            <p class="ap-hint" style="margin:0 0 12px;">
+                پشتیبان‌ها با <b>AES-256-GCM</b> رمزگذاری می‌شوند و فقط از طریق لینک امضاشدهٔ یک‌بارمصرف
+                (اعتبار ۱۲۰ ثانیه، وابسته به همین نشست) قابل دریافت‌اند. هر دانلود در گزارش امنیتی ثبت می‌شود.
+            </p>
+            <div id="securityState" style="display:flex; flex-direction:column; gap:8px;">
+                <div style="color:var(--text-muted); font-size:0.85rem;">در حال بررسی…</div>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
     <div class="card">
         <div class="card-header">
             <h2 class="card-title">مدیریت گزارش‌ها</h2>
@@ -3296,2094 +3487,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 </div>
 
 <script>
-const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-const adminUsername = '<?php echo $admin_username; ?>';
-
-
-function showToast(msg, type='success') {
-    const t = document.getElementById('toast');
-    t.innerHTML = (type === 'error' ? '✖ ' : '✔ ') + msg;
-    t.className = type === 'error' ? 'error show' : 'show';
-    setTimeout(() => t.className = '', 3000);
-}
-
-function closeModal(id) {
-    document.getElementById(id).style.display = 'none';
-}
-
-function confirmAction(action, id, text) {
-    const m = document.getElementById('confirmModal');
-    document.getElementById('confirmText').textContent = text;
-    m.style.display = 'flex';
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        performAction(action, id);
-    };
-}
-
-function openBanModal(id, name) {
-    document.getElementById('banUserId').value = id;
-    document.getElementById('banUserName').textContent = name;
-    document.getElementById('banModalOptions').style.display = 'flex';
-}
-
-function submitBan() {
-    const id = document.getElementById('banUserId').value;
-    const dur = document.getElementById('banDuration').value;
-    const reasonEl = document.getElementById('banReason');
-    const reason = reasonEl ? reasonEl.value.trim() : '';
-
-    closeModal('banModalOptions');
-    performAction('ban_user', 0, {user_id: id, duration: dur, reason: reason});
-    if (reasonEl) reasonEl.value = '';
-}
-
-function openInviteModal(roomName) {
-    document.getElementById('inviteRoomName').value = roomName;
-    document.getElementById('inviteUsername').value = '';
-    document.getElementById('inviteModal').style.display = 'flex';
-    document.getElementById('inviteUsername').focus();
-}
-
-// ── SMS gateway settings ────────────────────────────────────────────────────
-function smsPost(action, data) {
-    const fd = new FormData();
-    fd.append('action', action);
-    fd.append('csrf_token', csrfToken);
-    Object.keys(data || {}).forEach(k => fd.append(k, data[k]));
-    return fetch('admin.php', { method: 'POST', body: fd }).then(r => r.json());
-}
-
-function smsToggleWebhook() {
-    const sel = document.getElementById('smsProvider');
-    const row = document.getElementById('smsWebhookRow');
-    if (sel && row) row.style.display = (sel.value === 'webhook') ? 'block' : 'none';
-}
-
-function loadSmsSettings() {
-    smsPost('get_sms_settings').then(d => {
-        if (d.status !== 'success') return;
-        const s = d.settings || {};
-        const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
-        set('smsProvider', s.provider || 'none');
-        set('smsApiKey', s.api_key || '');
-        set('smsSender', s.sender || '');
-        set('smsPattern', s.pattern || '');
-        set('smsWebhook', s.webhook || '');
-        const en = document.getElementById('smsEnabled');
-        if (en) en.checked = !!s.enabled;
-        const dev = document.getElementById('smsDevMode');
-        if (dev) dev.checked = !!s.dev_mode;
-        smsToggleWebhook();
-
-        const dot = document.getElementById('smsStatusDot');
-        const label = document.getElementById('smsStatusLabel');
-        if (dot && label) {
-            if (s.ready) { dot.style.background = '#10b981'; dot.style.boxShadow = '0 0 0 3px rgba(16,185,129,0.2)'; label.textContent = 'متصل و آماده'; label.style.color = '#10b981'; }
-            else if (s.dev_mode) { dot.style.background = '#f59e0b'; dot.style.boxShadow = '0 0 0 3px rgba(245,158,11,0.2)'; label.textContent = 'حالت آزمایشی'; label.style.color = '#f59e0b'; }
-            else { dot.style.background = '#ef4444'; dot.style.boxShadow = '0 0 0 3px rgba(239,68,68,0.2)'; label.textContent = 'متصل نیست'; label.style.color = '#ef4444'; }
-        }
-
-        const box = document.getElementById('smsLogBox');
-        if (box) {
-            if (!d.log || !d.log.length) { box.innerHTML = 'هنوز پیامکی ارسال نشده است.'; }
-            else {
-                box.innerHTML = d.log.map(function (r) {
-                    const ok = String(r.ok) === '1';
-                    const cls = ok ? 'sms-log-ok' : 'sms-log-bad';
-                    const txt = ok ? 'موفق' : (r.detail || 'ناموفق');
-                    return '<div class="sms-log-row">'
-                        + '<span dir="ltr">' + (r.phone || '') + '</span>'
-                        + '<span class="' + cls + '">' + txt + '</span>'
-                        + '<span class="sms-log-time">' + (r.created_at || '') + '</span></div>';
-                }).join('');
-            }
-        }
-    }).catch(function () {});
-}
-
-function saveSmsSettings() {
-    const data = {
-        sms_provider: document.getElementById('smsProvider').value,
-        sms_api_key: document.getElementById('smsApiKey').value,
-        sms_sender: document.getElementById('smsSender').value,
-        sms_pattern: document.getElementById('smsPattern').value,
-        sms_webhook: document.getElementById('smsWebhook').value,
-        sms_enabled: document.getElementById('smsEnabled').checked ? '1' : '0',
-        sms_dev_mode: document.getElementById('smsDevMode').checked ? '1' : '0'
-    };
-    smsPost('save_sms_settings', data).then(function (d) {
-        showToast(d.message, d.status === 'success' ? 'success' : 'error');
-        loadSmsSettings();
-    }).catch(function () { showToast('خطای شبکه', 'error'); });
-}
-
-function testSms() {
-    const phone = (document.getElementById('smsTestPhone').value || '').trim();
-    if (!/^09[0-9]{9}$/.test(phone)) { showToast('شماره موبایل معتبر وارد کنید', 'error'); return; }
-    showToast('در حال ارسال پیام آزمایشی...', 'success');
-    smsPost('test_sms', { phone: phone }).then(function (d) {
-        showToast(d.message, d.status === 'success' ? 'success' : 'error');
-        loadSmsSettings();
-    }).catch(function () { showToast('خطای شبکه', 'error'); });
-}
-
-function clearLoginAttempts() {
-    if (typeof confirmAction === 'function') {
-        confirmAction('clear_login_attempts', 0, 'سابقه تلاش‌های ورود پاک شود؟ (قفل ورود کاربران آزاد می‌شود)');
-    } else {
-        smsPost('clear_login_attempts').then(function (d) { showToast(d.message, d.status === 'success' ? 'success' : 'error'); });
-    }
-}
-
-/* ── Media manager ──────────────────────────────────────────────────────── */
-const mediaState = { page: 1, pages: 1, total: 0, items: [], sel: new Set(), busy: false };
-
-function _mediaFmtSize(b) {
-    b = Number(b) || 0;
-    if (b <= 0) return '—';
-    if (b < 1024) return b + ' B';
-    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
-    if (b < 1073741824) return (b / 1048576).toFixed(2) + ' MB';
-    return (b / 1073741824).toFixed(2) + ' GB';
-}
-
-function _mediaEsc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-        return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
-    });
-}
-
-function _mediaPost(action, data) {
-    const fd = new FormData();
-    fd.append('action', action);
-    fd.append('csrf_token', csrfToken);
-    Object.keys(data || {}).forEach(function (k) { fd.append(k, data[k]); });
-    return fetch('admin.php', { method: 'POST', body: fd, credentials: 'same-origin' })
-        .then(function (r) { return r.json(); });
-}
-
-function _mediaConfirm(text, onYes) {
-    const m = document.getElementById('confirmModal');
-    const txt = document.getElementById('confirmText');
-    const yes = document.getElementById('confirmYes');
-    if (!m || !txt || !yes) { if (window.confirm(text)) onYes(); return; }
-    txt.textContent = text;
-    m.style.display = 'flex';
-    yes.onclick = function () { closeModal('confirmModal'); onYes(); };
-}
-
-function loadMediaList(page) {
-    const tbody = document.getElementById('mediaList');
-    if (!tbody) return;
-    if (mediaState.busy) return;
-    mediaState.busy = true;
-    mediaState.page = Math.max(1, parseInt(page, 10) || 1);
-    tbody.innerHTML = '<tr><td colspan="9" class="media-empty">در حال بارگذاری…</td></tr>';
-
-    _mediaPost('list_media', {
-        mtype: (document.getElementById('mediaType') || {}).value || 'all',
-        q: ((document.getElementById('mediaSearch') || {}).value || '').trim(),
-        gone: (document.getElementById('mediaGoneOnly') && document.getElementById('mediaGoneOnly').checked) ? 1 : 0,
-        page: mediaState.page
-    }).then(function (d) {
-        mediaState.busy = false;
-        if (!d || d.status !== 'success') {
-            tbody.innerHTML = '<tr><td colspan="9" class="media-empty">خطا در دریافت فهرست رسانه‌ها</td></tr>';
-            showToast((d && d.message) || 'خطا در دریافت فهرست', 'error');
-            return;
-        }
-        mediaState.items = d.items || [];
-        mediaState.pages = d.pages || 1;
-        mediaState.total = d.total || 0;
-        // Selection only lives as long as the page it was made on.
-        mediaState.sel.clear();
-        renderMediaRows();
-        _mediaSyncSel();
-        const cnt = document.getElementById('mediaCount');
-        if (cnt) cnt.textContent = mediaState.total.toLocaleString('fa-IR') + ' رسانه';
-    }).catch(function () {
-        mediaState.busy = false;
-        tbody.innerHTML = '<tr><td colspan="9" class="media-empty">خطای شبکه</td></tr>';
-        showToast('خطای شبکه', 'error');
-    });
-}
-
-function renderMediaRows() {
-    const tbody = document.getElementById('mediaList');
-    if (!tbody) return;
-    if (!mediaState.items.length) {
-        tbody.innerHTML = '<tr><td colspan="9" class="media-empty">رسانه‌ای با این فیلتر پیدا نشد</td></tr>';
-        return;
-    }
-    const meta = { video: { ico: 'play.png', label: 'ویدیو' }, image: { ico: 'image.png', label: 'تصویر' }, voice: { ico: 'mic.png', label: 'صوتی' } };
-    let html = '';
-    mediaState.items.forEach(function (it) {
-        const m = meta[it.type] || { ico: 'file.png', label: 'فایل' };
-        const state = it.deleted
-            ? '<span class="media-state gone" title="' + _mediaEsc(it.deleted_by ? ('توسط ' + it.deleted_by + ' در ' + it.deleted_at) : '') + '">حذف شده</span>'
-            : '<span class="media-state live">موجود</span>';
-        html += '<tr data-mid="' + it.id + '">'
-            + '<td><input type="checkbox" class="media-pick" value="' + it.id + '" onchange="onMediaPick(this)"></td>'
-            + '<td><span class="media-type ' + it.type + '"><img src="assets/icons3d/' + m.ico + '" alt="">' + m.label + '</span></td>'
-            + '<td>' + _mediaEsc(it.sender) + '</td>'
-            + '<td>' + _mediaEsc(it.where) + '</td>'
-            + '<td><span class="media-name" title="' + _mediaEsc(it.name) + '">' + _mediaEsc(it.name || '—') + '</span></td>'
-            + '<td><span class="media-size">' + _mediaFmtSize(it.size) + '</span></td>'
-            + '<td style="font-size:0.78rem;opacity:0.8">' + _mediaEsc(it.created_at) + '</td>'
-            + '<td>' + state + '</td>'
-            + '<td><button type="button" class="media-del-btn" onclick="deleteMedia(['
-            + it.id + '])"' + (it.deleted ? ' disabled' : '') + '><img src="assets/icons3d/trash.png" alt="">حذف</button></td>'
-            + '</tr>';
-    });
-    tbody.innerHTML = html;
-    renderMediaPager();
-}
-
-function renderMediaPager() {
-    const box = document.getElementById('mediaPager');
-    if (!box) return;
-    const p = mediaState.page, n = mediaState.pages;
-    if (n <= 1) { box.innerHTML = ''; return; }
-    let html = '<button type="button" onclick="loadMediaList(' + (p - 1) + ')"' + (p <= 1 ? ' disabled' : '') + '>›</button>';
-    const from = Math.max(1, p - 2), to = Math.min(n, from + 4);
-    for (let i = from; i <= to; i++) {
-        html += '<button type="button" class="' + (i === p ? 'active' : '') + '" onclick="loadMediaList(' + i + ')">' + i + '</button>';
-    }
-    html += '<button type="button" onclick="loadMediaList(' + (p + 1) + ')"' + (p >= n ? ' disabled' : '') + '>‹</button>';
-    box.innerHTML = html;
-}
-
-function onMediaPick(cb) {
-    const id = parseInt(cb.value, 10) || 0;
-    if (!id) return;
-    if (cb.checked) mediaState.sel.add(id); else mediaState.sel.delete(id);
-    _mediaSyncSel();
-}
-
-function toggleAllMedia(el) {
-    const boxes = document.querySelectorAll('#mediaList .media-pick');
-    mediaState.sel.clear();
-    boxes.forEach(function (cb) {
-        cb.checked = !!el.checked;
-        if (el.checked) mediaState.sel.add(parseInt(cb.value, 10) || 0);
-    });
-    _mediaSyncSel();
-}
-
-function _mediaSyncSel() {
-    const btn = document.getElementById('mediaDelSel');
-    if (!btn) return;
-    const n = mediaState.sel.size;
-    btn.disabled = n === 0;
-    btn.textContent = n > 0 ? ('حذف انتخاب‌شده‌ها (' + n + ')') : 'حذف انتخاب‌شده‌ها';
-    const all = document.getElementById('mediaAll');
-    if (all) {
-        const boxes = document.querySelectorAll('#mediaList .media-pick');
-        all.checked = boxes.length > 0 && n === boxes.length;
-        all.indeterminate = n > 0 && n < boxes.length;
-    }
-}
-
-function deleteMedia(ids) {
-    ids = (ids || []).filter(function (v) { return v > 0; });
-    if (!ids.length) return;
-    const one = ids.length === 1;
-    _mediaConfirm(
-        one
-            ? 'رسانه این پیام حذف شود؟ فایل برای همیشه پاک می‌شود، اما جای پیام در گفتگو با کادر «این پیام حذف شده» باقی می‌ماند.'
-            : ('رسانه ' + ids.length + ' پیام انتخاب‌شده حذف شود؟ فایل‌ها برای همیشه پاک می‌شوند، اما جای پیام‌ها باقی می‌ماند.'),
-        function () {
-            _mediaPost('delete_media', { ids: ids.join(',') }).then(function (d) {
-                if (!d || d.status !== 'success') {
-                    showToast((d && d.message) || 'حذف انجام نشد', 'error');
-                    return;
-                }
-                showToast(d.message || 'رسانه حذف شد');
-                loadMediaList(mediaState.page);
-            }).catch(function () { showToast('خطای شبکه', 'error'); });
-        }
-    );
-}
-
-function deleteMediaSelected() {
-    const ids = Array.from(mediaState.sel);
-    if (!ids.length) { showToast('ابتدا رسانه‌ای را انتخاب کنید', 'error'); return; }
-    deleteMedia(ids);
-}
-
-// One button, no row-picking: removes every media item that matches what the
-// table is currently filtered to. Two confirmations, because there is no undo.
-function deleteMediaAllFiltered() {
-    const btn = document.getElementById('mediaDelAll');
-    if (mediaState.busy) return;
-
-    const mtype = (document.getElementById('mediaType') || {}).value || 'all';
-    const q     = ((document.getElementById('mediaSearch') || {}).value || '').trim();
-    const gone  = !!(document.getElementById('mediaGoneOnly') && document.getElementById('mediaGoneOnly').checked);
-
-    if (gone) {
-        showToast('در حالت «فقط حذف‌شده‌ها» چیزی برای حذف نمانده است', 'error');
-        return;
-    }
-
-    const typeLabel = { all: 'همه رسانه‌ها', video: 'همه ویدیوها', image: 'همه تصاویر', voice: 'همه پیام‌های صوتی' }[mtype] || 'همه رسانه‌ها';
-    const scope = q ? (typeLabel + ' که با «' + q + '» مطابقت دارند') : typeLabel;
-    const total = mediaState.total || 0;
-
-    _mediaConfirm(
-        'حذف یکجای ' + scope + '؟ ' +
-        (total > 0 ? ('حدود ' + total.toLocaleString('fa-IR') + ' رسانه در این فیلتر وجود دارد. ') : '') +
-        'فایل‌ها برای همیشه حذف می‌شوند و جای پیام‌ها با «این پیام حذف شده» باقی می‌ماند. این کار قابل بازگشت نیست.',
-        function () {
-            // Second gate: a single stray click on the loudest button on the
-            // page must not be enough to empty the library.
-            if (!window.confirm('تأیید نهایی: ' + scope + ' برای همیشه حذف شود؟')) return;
-            _runDeleteMediaAll(mtype, q, btn);
-        }
-    );
-}
-
-function _runDeleteMediaAll(mtype, q, btn) {
-    mediaState.busy = true;
-    const oldLabel = btn ? btn.textContent : '';
-    if (btn) { btn.disabled = true; btn.textContent = 'در حال حذف…'; }
-    _mediaPost('delete_media_all', { mtype: mtype, q: q, gone: 0 })
-        .then(function (d) {
-            mediaState.busy = false;
-            if (btn) { btn.disabled = false; btn.textContent = oldLabel; }
-            if (!d || d.status !== 'success') {
-                showToast((d && d.message) || 'خطا در حذف رسانه‌ها', 'error');
-                return;
-            }
-            showToast(d.message);
-            mediaState.sel.clear();
-            loadMediaList(1);
-        })
-        .catch(function () {
-            mediaState.busy = false;
-            if (btn) { btn.disabled = false; btn.textContent = oldLabel; }
-            showToast('خطای شبکه', 'error');
-        });
-}
-
-document.addEventListener('DOMContentLoaded', function () {
-    if (document.getElementById('smsCard')) loadSmsSettings();
-    if (document.getElementById('mediaCard')) loadMediaList(1);
-});
-
-function performAction(action, id, extraData = {}) {    const fd = new FormData();
-    fd.append('action', action);
-    fd.append('csrf_token', csrfToken);
-    
-    if (id) fd.append(action.includes('user') || action === 'get_user_msgs' || action === 'burn_session' || action === 'view_user_msgs' ? 'user_id' : 'id', id);
-    for (let k in extraData) fd.append(k, extraData[k]);
-
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                showToast(d.message);
-                refreshData(); 
-                loadUsers();   // keep the paged user table in sync after any action
-            } else {
-                showToast(d.message, 'error');
-            }
-        })
-        .catch(() => showToast('خطای شبکه', 'error'));
-}
-
-function downloadBackup() {
-    window.location.href = 'admin.php?backup=1&csrf_token=' + csrfToken;
-}
-
-const backupFileInput = document.getElementById('backupFileInput');
-if (backupFileInput) {
-    backupFileInput.addEventListener('change', function () {
-        const f = this.files && this.files[0];
-        const nameEl = document.getElementById('backupFileName');
-        if (nameEl) nameEl.textContent = f ? f.name : 'فایلی انتخاب نشده';
-    });
-}
-
-function importBackup() {
-    const fileInput = document.getElementById('backupFileInput');
-    if(fileInput.files.length === 0) return showToast('لطفاً یک فایل .sql انتخاب کنید', 'error');
-    
-    confirmAction('import_db', 0, 'هشدار: اطلاعات فعلی دیتابیس به طور کامل با محتویات این فایل جایگزین خواهد شد. ادامه می‌دهید؟');
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        const fd = new FormData();
-        fd.append('action', 'import_db');
-        fd.append('csrf_token', csrfToken);
-        fd.append('backup_file', fileInput.files[0]);
-        
-        fetch('admin.php', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(d => {
-                if (d.status === 'success') {
-                    showToast(d.message);
-                    fileInput.value = '';
-                    refreshData(); 
-                } else {
-                    showToast(d.message, 'error');
-                }
-            })
-            .catch(() => showToast('خطای شبکه', 'error'));
-    };
-}
-
-function createRoom() {
-    const name = document.getElementById('roomName').value;
-    const type = document.getElementById('roomType').value;
-    if(!name) return showToast('لطفاً نام اتاق را وارد کنید', 'error');
-    performAction('create_room', 0, {name: name, type: type});
-    document.getElementById('roomName').value = '';
-}
-
-function submitInvite() {
-    const room = document.getElementById('inviteRoomName').value;
-    const user = document.getElementById('inviteUsername').value;
-    if(!user) return showToast('لطفاً نام کاربری را وارد کنید', 'error');
-    
-    closeModal('inviteModal');
-    performAction('invite_user', 0, {room_name: room, username: user});
-}
-
-function globalReset() {
-    const pass = document.getElementById('resetPass').value;
-    if(!pass) return showToast('رمز عبور الزامی است', 'error');
-    confirmAction('global_reset', 0, 'هشدار نهایی: کل دیتابیس (کاربران، اتاق‌های شخصی، پیام‌ها) پاک می‌شود!');
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        performAction('global_reset', 0, {password: pass});
-    };
-}
-
-function enableAutoReset() {
-    const h = document.getElementById('autoResetHours').value;
-    const recurring = document.getElementById('autoResetRecurring').checked ? 1 : 0;
-    if(!h || h < 1) return showToast('لطفاً ساعت را وارد کنید', 'error');
-    performAction('enable_auto_reset', 0, {hours: h, recurring: recurring});
-}
-
-function disableAutoReset() {
-    performAction('disable_auto_reset', 0);
-}
-
-function toggleLock() {
-    performAction('toggle_upload_lock', 0);
-}
-
-/**
- * Saves the maintenance note shown on the public lock screen.
- * Kept separate from the toggle so an admin can fix the wording without
- * taking the site down (and vice versa).
- */
-function saveSiteLockReason() {
-    const el = document.getElementById('siteLockReason');
-    const msg = document.getElementById('siteLockReasonMsg');
-    const btn = (typeof event !== 'undefined' && event && event.currentTarget) ? event.currentTarget : null;
-    if (btn) btn.disabled = true;
-    if (msg) { msg.textContent = 'در حال ذخیره…'; msg.style.color = 'var(--text-muted)'; }
-
-    const fd = new FormData();
-    fd.append('action', 'save_site_lock_reason');
-    fd.append('reason', el ? el.value : '');
-
-    fetch('admin.php', { method: 'POST', body: fd, credentials: 'same-origin' })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                if (msg) { msg.textContent = d.message; msg.style.color = '#6ee7b7'; }
-                if (el) el.dataset.dirty = '';
-                showToast(d.message, 'success');
-            } else {
-                if (msg) { msg.textContent = d.message || 'خطا'; msg.style.color = '#f87171'; }
-                showToast(d.message || 'خطا در ذخیره', 'error');
-            }
-        })
-        .catch(() => {
-            if (msg) { msg.textContent = 'خطای شبکه'; msg.style.color = '#f87171'; }
-        })
-        .finally(() => { if (btn) btn.disabled = false; });
-}
-
-function toggleVoiceLock() {
-    performAction('toggle_voice_lock', 0);
-}
-
-function toggleSiteLock() {
-    performAction('toggle_site_lock', 0);
-}
-
-function toggleReportLock() {
-    performAction('toggle_report_lock', 0);
-}
-
-function toggleDeleteLock() {
-    performAction('toggle_delete_lock', 0);
-}
-
-function sendGlobalNotif() {
-    const msg = document.getElementById('globalNotifMsg').value;
-    if(!msg) return showToast('متن پیام خالی است', 'error');
-    
-    confirmAction('send_global_notif', 0, 'آیا از ارسال این پیام به تمام کاربران مطمئن هستید؟');
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        performAction('send_global_notif', 0, {message: msg});
-        document.getElementById('globalNotifMsg').value = '';
-    };
-}
-
-let _msgGroups = [];
-
-function viewUserMsgs(id, name) {
-    const fd = new FormData();
-    fd.append('action', 'get_user_msgs');
-    fd.append('user_id', id);
-    fd.append('csrf_token', csrfToken);
-    
-    document.getElementById('msgViewList').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">در حال بارگذاری...</div>';
-    document.getElementById('msgViewTabs').innerHTML = '';
-    document.getElementById('msgViewTitle').textContent = 'پیام‌های ' + name;
-    document.getElementById('msgViewModal').style.display = 'flex';
-    
-    fetch('admin.php', { method: 'POST', body: fd })
-    .then(r => r.json())
-    .then(d => {
-        if (d.status === 'success') {
-            _msgGroups = d.groups || [];
-            if (_msgGroups.length === 0) {
-                document.getElementById('msgViewTabs').innerHTML = '';
-                document.getElementById('msgViewList').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">هیچ پیامی یافت نشد</div>';
-                return;
-            }
-            renderMsgTabs(0);
-        } else {
-            showToast(d.message, 'error');
-        }
-    });
-}
-
-function renderMsgTabs(activeIdx) {
-    const tabsEl = document.getElementById('msgViewTabs');
-    let tabHtml = '';
-    _msgGroups.forEach((g, i) => {
-        const isActive = i === activeIdx;
-        tabHtml += `<button onclick="renderMsgTabs(${i})" style="padding:6px 14px; border-radius:10px; border:1px solid ${isActive ? 'rgba(99,102,241,0.7)' : 'rgba(255,255,255,0.12)'}; background:${isActive ? 'rgba(99,102,241,0.25)' : 'rgba(255,255,255,0.05)'}; color:${isActive ? '#a5b4fc' : '#94a3b8'}; cursor:pointer; font-family:inherit; font-size:0.8rem; white-space:nowrap; transition:all 0.2s;">${g.label} <span style="opacity:0.6">(${g.msgs.length})</span></button>`;
-    });
-    tabsEl.innerHTML = tabHtml;
-
-    const msgs = _msgGroups[activeIdx].msgs;
-    let html = '';
-    msgs.forEach(m => {
-        const typeIcon = m.msg_type === 'text' ? '📝' : (m.msg_type === 'voice' ? '🎤' : '📁');
-        const content = m.msg_type === 'text' ? (m.message || '') : (m.msg_type === 'voice' ? 'پیام صوتی' : 'فایل: ' + (m.file_name || ''));
-        const isSent = m.sender_name === _msgGroups[activeIdx].label.split(': ')[1] || m.sender_name;
-        html += `<div class="admin-msg-item">
-            <div class="admin-msg-meta">
-                <span style="color:#a5b4fc">${m.sender_name}</span>
-                <span>${m.created_at}</span>
-            </div>
-            <div style="color:#fff; word-break:break-word">${typeIcon} ${content}</div>
-        </div>`;
-    });
-    document.getElementById('msgViewList').innerHTML = html;
-}
-
-function refreshData() {
-    const fd = new FormData();
-    fd.append('action', 'get_live_data');
-    fd.append('csrf_token', csrfToken);
-    
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if(d.status === 'success') {
-                document.getElementById('statUsers').textContent = d.stats.users;
-                document.getElementById('statMsgs').textContent = d.stats.msgs;
-                document.getElementById('statRooms').textContent = d.stats.rooms;
-                
-                const lockBtn = document.getElementById('lockBtn');
-                const lockText = document.getElementById('lockStatusText');
-                if (d.lock_upload) {
-                    lockBtn.textContent = 'باز کردن قفل فایل';
-                    lockBtn.className = 'btn btn-success'; 
-                    lockBtn.style.background = '#10b981';
-                    lockText.innerHTML = '<span style="color:#ef4444">⛔ ارسال فایل قفل است</span>';
-                } else {
-                    lockBtn.textContent = 'قفل کردن فایل';
-                    lockBtn.className = 'btn btn-danger';
-                    lockBtn.style.background = ''; 
-                    lockText.innerHTML = '<span style="color:#10b981">✔ ارسال فایل آزاد است</span>';
-                }
-
-                const voiceLockBtn = document.getElementById('voiceLockBtn');
-                const voiceLockText = document.getElementById('voiceLockStatusText');
-                if (d.lock_voice) {
-                    voiceLockBtn.textContent = 'باز کردن قفل ویس';
-                    voiceLockBtn.className = 'btn btn-success'; 
-                    voiceLockBtn.style.background = '#10b981';
-                    voiceLockText.innerHTML = '<span style="color:#ef4444">⛔ ارسال ویس قفل است</span>';
-                } else {
-                    voiceLockBtn.textContent = 'قفل کردن ویس';
-                    voiceLockBtn.className = 'btn btn-danger';
-                    voiceLockBtn.style.background = ''; 
-                    voiceLockText.innerHTML = '<span style="color:#10b981">✔ ارسال ویس آزاد است</span>';
-                }
-
-                const reportLockBtn = document.getElementById('reportLockBtn');
-                const reportLockText = document.getElementById('reportLockStatusText');
-                if (d.report_lock) {
-                    reportLockBtn.textContent = 'باز کردن قفل گزارش';
-                    reportLockBtn.className = 'btn btn-success'; 
-                    reportLockBtn.style.background = '#10b981';
-                    reportLockText.innerHTML = '<span style="color:#ef4444">⛔ گزارش‌دهی قفل است</span>';
-                } else {
-                    reportLockBtn.textContent = 'قفل کردن گزارش';
-                    reportLockBtn.className = 'btn btn-danger';
-                    reportLockBtn.style.background = ''; 
-                    reportLockText.innerHTML = '<span style="color:#10b981">✔ گزارش‌دهی فعال است</span>';
-                }
-
-                const deleteLockBtn = document.getElementById('deleteLockBtn');
-                const deleteLockText = document.getElementById('deleteLockStatusText');
-                if (d.delete_lock) {
-                    deleteLockBtn.textContent = 'فعال کردن حذف';
-                    deleteLockBtn.className = 'btn btn-success';
-                    deleteLockBtn.style.background = '#10b981';
-                    deleteLockText.innerHTML = '<span style="color:#ef4444">🔒 حذف پیام‌ها و محتوا غیرفعال است</span>';
-                } else {
-                    deleteLockBtn.textContent = 'غیرفعال کردن حذف';
-                    deleteLockBtn.className = 'btn btn-danger';
-                    deleteLockBtn.style.background = '';
-                    deleteLockText.innerHTML = '<span style="color:#10b981">✔ حذف پیام‌ها و محتوا فعال است</span>';
-                }
-
-                const siteLockBtn = document.getElementById('siteLockBtn');
-                const siteLockText = document.getElementById('siteLockStatusText');
-                if (d.site_lock) {
-                    siteLockBtn.textContent = 'باز کردن سایت';
-                    siteLockBtn.className = 'btn btn-success';
-                    siteLockBtn.style.background = '#10b981';
-                    siteLockText.innerHTML = '<span style="color:#ef4444">⛔ سایت قفل و از دسترس خارج است</span>';
-                } else {
-                    siteLockBtn.textContent = 'قفل کردن سایت';
-                    siteLockBtn.className = 'btn btn-danger';
-                    siteLockBtn.style.background = '';
-                    siteLockText.innerHTML = '<span style="color:#10b981">✔ سایت در دسترس است</span>';
-                }
-
-                // Only fill the box when the admin is not typing in it.
-                const lockReasonEl = document.getElementById('siteLockReason');
-                if (lockReasonEl && document.activeElement !== lockReasonEl && !lockReasonEl.dataset.dirty) {
-                    lockReasonEl.value = d.site_lock_reason || '';
-                }
-
-                document.getElementById('autoResetStatus').textContent = 'وضعیت: ' + d.auto_reset_text;
-                if(d.auto_reset_recurring) {
-                    document.getElementById('autoResetRecurring').checked = true;
-                }
-
-                if (d.max_users !== undefined) {
-                    document.getElementById('maxUsersStatusText').textContent = d.max_users + ' حساب از هر دستگاه';
-                    const inp = document.getElementById('maxUsersInput');
-                    if (inp && !inp.value) inp.placeholder = d.max_users;
-                }
-
-                updateRooms(d.rooms);
-                updateReports(d.reports);
-                updateBannedIps(d.banned_ips || []);
-                updateChannelsList(d.rooms || []);
-                loadAdminsList();
-                loadUpdateNotifs();
-                loadHideAdminOnlineState();
-                loadDemoState();
-                loadAccessState();
-            }
-        })
-        .catch(() => { /* transient abort (navigation/connection churn) — the next 3 s tick recovers */ });
-}
-
-function previewBrandLogo(input) {
-    const f = input.files && input.files[0];
-    if (!f) return;
-    if (f.size > 2 * 1024 * 1024) {
-        showToast('حجم تصویر حداکثر ۲ مگابایت است', 'error');
-        input.value = '';
-        return;
-    }
-    const box = document.getElementById('brandLogoPreview');
-    if (box) box.innerHTML = '<img src="' + URL.createObjectURL(f) + '" style="width:100%;height:100%;object-fit:contain;display:block;">';
-}
-
-function saveBranding() {
-    const name = document.getElementById('brandNameInput').value.trim();
-    const tag = document.getElementById('brandTaglineInput').value.trim();
-    const ver = document.getElementById('siteVersionInput') ? document.getElementById('siteVersionInput').value.trim() : '';
-    if (name.length < 2) return showToast('نام برند حداقل ۲ حرف باشد', 'error');
-    const fd = new FormData();
-    fd.append('action', 'save_branding');
-    fd.append('csrf_token', csrfToken);
-    fd.append('brand_name', name);
-    fd.append('brand_tagline', tag);
-    fd.append('site_version_label', ver);
-    const fi = document.getElementById('brandLogoInput');
-    if (fi && fi.files && fi.files[0]) fd.append('brand_logo', fi.files[0]);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            showToast(d.message, d.status === 'success' ? 'success' : 'error');
-            if (d.status === 'success') setTimeout(() => location.reload(), 800);
-        })
-        .catch(() => showToast('خطای شبکه', 'error'));
-}
-
-function resetBrandLogo() {
-    confirmAction('reset_brand_logo', 0, 'لوگوی فعلی حذف شود و حرف برند نمایش داده شود؟');
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        const fd = new FormData();
-        fd.append('action', 'reset_brand_logo');
-        fd.append('csrf_token', csrfToken);
-        fetch('admin.php', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(d => {
-                showToast(d.message, d.status === 'success' ? 'success' : 'error');
-                if (d.status === 'success') setTimeout(() => location.reload(), 800);
-            })
-            .catch(() => showToast('خطای شبکه', 'error'));
-    };
-}
-
-const FONT_WEIGHTS = {
-    default: [{ v: 400, label: 'معمولی' }],
-    dana: [
-        { v: 100, label: 'نازک' }, { v: 200, label: 'خیلی سبک' }, { v: 300, label: 'سبک' },
-        { v: 400, label: 'معمولی' }, { v: 500, label: 'متوسط' }, { v: 700, label: 'بولد' },
-        { v: 800, label: 'فوق بولد' }, { v: 900, label: 'سیاه' }
-    ],
-    kalameh: [
-        { v: 100, label: 'نازک' }, { v: 300, label: 'سبک' }, { v: 400, label: 'معمولی' },
-        { v: 500, label: 'متوسط' }, { v: 700, label: 'بولد' }, { v: 800, label: 'فوق بولد' },
-        { v: 900, label: 'سیاه' }
-    ]
+/* Panel boot values. Everything else lives in assets/js/admin.js so the page
+   stays a template and the behaviour stays cacheable. */
+window.VX_ADMIN = {
+    username: <?php echo json_encode($admin_username, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>,
+    fontWeight: <?php echo (int)$uiFontWeight; ?>
 };
-
-function updateFontWeights(keep) {
-    const famEl = document.getElementById('fontFamilySelect');
-    const sel = document.getElementById('fontWeightSelect');
-    if (!famEl || !sel) return;
-    const list = FONT_WEIGHTS[famEl.value] || FONT_WEIGHTS.default;
-    const prev = keep ? parseInt(sel.value, 10) : null;
-    sel.innerHTML = list.map(function (o) {
-        return '<option value="' + o.v + '">' + o.label + ' — ' + o.v + '</option>';
-    }).join('');
-    if (prev && list.some(function (o) { return o.v === prev; })) sel.value = String(prev);
-    applyFontPreview();
-}
-
-function applyFontPreview() {
-    const famEl = document.getElementById('fontFamilySelect');
-    const wEl = document.getElementById('fontWeightSelect');
-    const p = document.getElementById('fontPreview');
-    if (!famEl || !wEl || !p) return;
-    const fam = famEl.value;
-    const w = parseInt(wEl.value, 10) || 400;
-    p.style.fontFamily = fam === 'default' ? "'AppFont', sans-serif" : (fam === 'dana' ? "'PrevDana'" : "'PrevKalameh'");
-    p.style.fontWeight = w;
-}
-
-function saveFont() {
-    const fd = new FormData();
-    fd.append('action', 'save_font');
-    fd.append('csrf_token', csrfToken);
-    fd.append('ui_font_family', document.getElementById('fontFamilySelect').value);
-    fd.append('ui_font_weight', document.getElementById('fontWeightSelect').value);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            showToast(d.message, d.status === 'success' ? 'success' : 'error');
-            if (d.status === 'success') setTimeout(() => location.reload(), 700);
-        })
-        .catch(() => showToast('خطای شبکه', 'error'));
-}
-
-/* ── Message-body font (admin only) ─────────────────────────────────────── */
-function applyMsgFontPreview() {
-    const famEl = document.getElementById('msgFontFamilySelect');
-    const wEl = document.getElementById('msgFontWeightSelect');
-    const sample = document.getElementById('msgFontSample');
-    if (!famEl || !wEl || !sample) return;
-    const fam = famEl.value;
-    // The preview faces are already registered by #fontPreviewFaces.
-    sample.style.fontFamily = fam === 'dana' ? "'PrevDana', inherit"
-                            : fam === 'kalameh' ? "'PrevKalameh', inherit"
-                            : 'inherit';
-    sample.style.fontWeight = wEl.value;
-}
-
-function saveMsgFont() {
-    const msg = document.getElementById('msgFontMsg');
-    const famEl = document.getElementById('msgFontFamilySelect');
-    const wEl = document.getElementById('msgFontWeightSelect');
-    if (!famEl || !wEl) return;
-
-    const fd = new FormData();
-    fd.append('action', 'save_msg_font');
-    fd.append('csrf_token', csrfToken);
-    fd.append('msg_font_family', famEl.value);
-    fd.append('msg_font_weight', wEl.value);
-
-    if (msg) { msg.textContent = 'در حال ذخیره…'; msg.style.color = 'var(--text-muted)'; }
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                if (msg) { msg.textContent = 'ذخیره شد ✓'; msg.style.color = '#6ee7b7'; }
-                showToast(d.message, 'success');
-                setTimeout(() => location.reload(), 800);
-            } else {
-                if (msg) { msg.textContent = d.message || 'خطا'; msg.style.color = '#f87171'; }
-                showToast(d.message || 'خطا در ذخیره', 'error');
-            }
-        })
-        .catch(() => {
-            if (msg) { msg.textContent = 'خطای شبکه'; msg.style.color = '#f87171'; }
-            showToast('خطای شبکه', 'error');
-        });
-}
-
-(function initMsgFontUI() {
-    if (document.getElementById('msgFontFamilySelect')) applyMsgFontPreview();
-})();
-
-(function initFontUI() {
-    const famEl = document.getElementById('fontFamilySelect');
-    if (!famEl) return;
-    updateFontWeights(false);
-    const saved = '<?php echo (int)$uiFontWeight; ?>';
-    const sel = document.getElementById('fontWeightSelect');
-    if (sel && [].some.call(sel.options, function (o) { return o.value === saved; })) sel.value = saved;
-    applyFontPreview();
-})();
-
-function setMaxUsers() {
-    const val = parseInt(document.getElementById('maxUsersInput').value);
-    if (!val || val < 1) return showToast('یک عدد معتبر وارد کنید', 'error');
-    confirmAction('set_max_users', 0, `سقف ساخت حساب به ${val} تغییر می‌یابد. ادامه می‌دهید؟`);
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        performAction('set_max_users', 0, { max_users: val });
-        document.getElementById('maxUsersInput').value = '';
-    };
-}
-
-function updateRooms(rooms) {
-    const tbody = document.getElementById('roomsList');
-    let html = '';
-    rooms.forEach(r => {
-        let btn = '';
-        if(r.is_default) {
-            btn = '<span class="badge badge-secondary">اصلی</span>';
-        } else {
-            let invite = r.type === 'private' ? `<button onclick="openInviteModal('${r.name}')" class="btn btn-primary btn-sm" style="margin-left:5px">دعوت</button>` : '';
-            btn = `${invite}<button onclick="confirmAction('delete_room', ${r.id}, 'آیا از حذف اتاق ${r.name} مطمئن هستید؟')" class="btn btn-danger btn-sm">حذف</button>`;
-        }
-        
-        let creatorInfo = r.creator;
-        if(r.creator !== 'سیستم') {
-            creatorInfo = `<span style="color:#a5b4fc">${r.creator}</span>`;
-        }
-        
-        html += `<tr id="room-${r.id}">
-            <td><b>${r.name}</b></td>
-            <td>${r.type_html}</td>
-            <td>${creatorInfo}</td>
-            <td><div style="display:flex; justify-content:flex-end;">${btn}</div></td>
-        </tr>`;
-    });
-    if(tbody.innerHTML !== html) tbody.innerHTML = html;
-}
-
-function updateReports(reports) {
-    const tbody = document.getElementById('reportsList');
-    if (!reports || reports.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#94a3b8">هیچ گزارشی ثبت نشده است</td></tr>';
-        return;
-    }
-    let html = '';
-    reports.forEach(r => {
-        const statusBadge = r.status === 'approved' ? '<span style="color:#10b981;font-size:11px;">✔ تأیید شده</span>' : r.status === 'rejected' ? '<span style="color:#ef4444;font-size:11px;">✘ رد شده</span>' : '<span style="color:#fbbf24;font-size:11px;">⏳ در انتظار</span>';
-        const actionBtns = r.status === 'pending' ? `
-            <button onclick="performAction('approve_report', ${r.id}, null, 'تأیید گزارش و اقدام')" class="btn btn-sm" style="background:rgba(16,185,129,0.2);border-color:rgba(16,185,129,0.4);color:#6ee7b7">✔ تأیید</button>
-            <button onclick="approveReportAndBan(${r.id})" class="btn btn-sm" style="background:rgba(239,68,68,0.2);border-color:rgba(239,68,68,0.4);color:#fca5a5">🚫 تأیید+بن</button>
-            <button onclick="performAction('reject_report', ${r.id})" class="btn btn-sm" style="background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.3);color:#fca5a5">✘ رد</button>
-            <button onclick="openBanModal(${r.reported_id}, '${r.reported}')" class="btn btn-danger btn-sm">🚫 بن</button>
-        ` : `<button onclick="confirmAction('delete_report', ${r.id}, 'حذف گزارش؟')" class="btn btn-ghost btn-sm" style="color:#ef4444;border-color:#ef4444">🗑</button>`;
-        html += `<tr id="report-${r.id}">
-            <td style="color:#a5b4fc">${r.reporter}</td>
-            <td style="color:#f87171; font-weight:bold">${r.reported}</td>
-            <td><div style="max-width:180px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis" title="${r.reason}">${r.reason}</div></td>
-            <td style="font-size:0.8rem; color:#94a3b8">${r.time_ago}<br>${statusBadge}</td>
-            <td>
-                <div style="display:flex; justify-content:flex-end; gap:5px; flex-wrap:wrap">
-                    ${actionBtns}
-                </div>
-            </td>
-        </tr>`;
-    });
-    if(tbody.innerHTML !== html) tbody.innerHTML = html;
-}
-
-// ── Users table: server-side search + paging ────────────────────────────────
-// Only one page of accounts ever reaches the browser, so a 10k-user install
-// renders exactly as fast as a 10-user one.
-let usersPageCache = [];
-let usersTotal = 0;
-let usersPages = 1;
-let currentPage = 1;
-let usersPerPage = 10;
-let usersQuery = '';
-let _usersReqId = 0;
-let _usersSearchTimer = null;
-
-function loadUsers(page, q) {
-    if (page !== undefined && page !== null) currentPage = Math.max(1, parseInt(page, 10) || 1);
-    if (q !== undefined && q !== null) usersQuery = String(q);
-
-    const fd = new FormData();
-    fd.append('action', 'get_users');
-    fd.append('csrf_token', csrfToken);
-    fd.append('page', currentPage);
-    fd.append('per', usersPerPage);
-    fd.append('q', usersQuery);
-
-    const reqId = ++_usersReqId;
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (reqId !== _usersReqId) return; // a newer search already won
-            if (d.status !== 'success') { showToast(d.message || 'خطا در بارگذاری کاربران', 'error'); return; }
-            usersPageCache = d.users || [];
-            usersTotal = d.total || 0;
-            usersPages = d.pages || 1;
-            currentPage = d.page || 1;
-            renderUsers();
-        })
-        .catch(() => showToast('خطای شبکه', 'error'));
-}
-
-function renderUsers() {
-    const tbody = document.getElementById('usersList');
-    if (!tbody) return;
-
-    if (!usersPageCache.length) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#94a3b8; padding:22px">کاربری با این مشخصات پیدا نشد</td></tr>';
-    } else {
-        let html = '';
-        usersPageCache.forEach(u => {
-            let actions = '';
-            if (!u.is_admin) {
-                let banBtn = u.status_html.includes('مسدود')
-                    ? `<button onclick="confirmAction('unban_user', ${u.id}, 'آیا از رفع مسدودیت کاربر ${u.username} اطمینان دارید؟')" class="btn btn-primary btn-sm" style="margin-left:5px">رفع بن</button>`
-                    : `<button onclick="openBanModal(${u.id}, '${u.username}')" class="btn btn-danger btn-sm" style="margin-left:5px">مسدود</button>`;
-
-                actions = `${banBtn}
-                <button onclick="viewUserSessions(${u.id}, '${u.username}')" class="btn btn-primary btn-sm" style="margin-left:5px; background:linear-gradient(135deg,#0ea5e9,#38bdf8);" title="نشست‌های فعال">📡</button>
-                <button onclick="confirmAction('burn_session', ${u.id}, 'سشن کاربر ${u.username} سوزانده می‌شود و از حساب خارج می‌شود. ادامه می‌دهید؟')" class="btn btn-danger btn-sm" style="margin-left:5px; background:linear-gradient(135deg,#b45309,#f59e0b); border:none;" title="سوزاندن همه سشن‌ها">🔥</button>
-                <button onclick="viewUserMsgs(${u.id}, '${u.username}')" class="btn btn-primary btn-sm" style="margin-left:5px; background:linear-gradient(135deg, #3b82f6, #60a5fa)">👁</button>
-                <button onclick="confirmAction('delete_user_msgs', ${u.id}, 'تمام پیام‌های کاربر ${u.username} حذف شود؟')" class="btn btn-ghost btn-sm" style="color:#ef4444; border-color:#ef4444">پاکسازی</button>`;
-            }
-
-            const onlineBadge = u.is_online_bool
-                ? '<span class="status-dot online"></span> آنلاین'
-                : '<span class="status-dot offline"></span> آفلاین';
-
-            html += `<tr id="user-${u.id}">
-                <td>
-                    <div style="display:flex;align-items:center;gap:10px;">
-                        <span style="font-size:1.5em; background:rgba(255,255,255,0.1); width:40px; height:40px; display:flex; justify-content:center; align-items:center; border-radius:12px;">${u.sticker}</span>
-                        <div style="display:flex; flex-direction:column; align-items:flex-start">
-                            <span>${u.username}</span>
-                            ${u.is_admin ? '<span style="font-size:0.7em; opacity:0.7; color:#818cf8">مدیر کل</span>' : ''}
-                        </div>
-                    </div>
-                </td>
-                <td>${onlineBadge} <div style="font-size:0.75em; opacity:0.5; margin-top:4px">${u.time_ago}</div></td>
-                <td class="mono" style="direction:ltr">${u.ip_address || '-'}</td>
-                <td>${u.status_html}</td>
-                <td><div style="display:flex; justify-content:flex-end;">${actions}</div></td>
-            </tr>`;
-        });
-        tbody.innerHTML = html;
-    }
-
-    // Compact pager: first, last, and a window around the current page.
-    let pagHtml = '';
-    const pages = Math.max(1, usersPages);
-    const win = 2;
-    let lastDrawn = 0;
-    for (let i = 1; i <= pages; i++) {
-        const visible = (i === 1 || i === pages || Math.abs(i - currentPage) <= win);
-        if (!visible) continue;
-        if (lastDrawn && i - lastDrawn > 1) pagHtml += '<span style="opacity:.4;margin:0 4px">…</span>';
-        pagHtml += `<button onclick="changePage(${i})" class="btn ${i === currentPage ? 'btn-primary' : 'btn-ghost'} btn-sm" style="margin:2px; min-width:35px">${i}</button>`;
-        lastDrawn = i;
-    }
-    const pagBox = document.getElementById('paginationControls');
-    if (pagBox) pagBox.innerHTML = pagHtml;
-
-    const sum = document.getElementById('usersSummary');
-    if (sum) {
-        sum.textContent = usersTotal === 0
-            ? 'کاربری یافت نشد'
-            : `${usersTotal.toLocaleString('fa-IR')} کاربر — صفحه ${currentPage} از ${pages}`;
-    }
-}
-
-function changePage(p) {
-    loadUsers(p);
-}
-
-function filterUsers() {
-    // Debounced: typing "ali" fires one request, not three.
-    clearTimeout(_usersSearchTimer);
-    _usersSearchTimer = setTimeout(function () {
-        const el = document.getElementById('searchUser');
-        loadUsers(1, el ? el.value.trim() : '');
-    }, 300);
-}
-
-setInterval(refreshData, 3000);
-refreshData();
-loadUsers(1, '');
-
-function banIpAction() {
-    const ip = document.getElementById('banIpInput').value.trim();
-    const reason = document.getElementById('banIpReason').value.trim() || 'بن توسط مدیر';
-    if (!ip) return showToast('آدرس IP را وارد کنید', 'error');
-    confirmAction('ban_ip', 0, `آیا از مسدود کردن IP ${ip} اطمئن هستید؟`);
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        const fd = new FormData();
-        fd.append('action', 'ban_ip');
-        fd.append('csrf_token', csrfToken);
-        fd.append('ip_address', ip);
-        fd.append('reason', reason);
-        fetch('admin.php', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(d => {
-                if (d.status === 'success') {
-                    showToast(d.message);
-                    document.getElementById('banIpInput').value = '';
-                    document.getElementById('banIpReason').value = '';
-                    refreshData();
-                } else {
-                    showToast(d.message, 'error');
-                }
-            });
-    };
-}
-
-function unbanIpAction(ip) {
-    confirmAction('unban_ip', 0, `رفع مسدودیت IP ${ip}؟`);
-    document.getElementById('confirmYes').onclick = () => {
-        closeModal('confirmModal');
-        const fd = new FormData();
-        fd.append('action', 'unban_ip');
-        fd.append('csrf_token', csrfToken);
-        fd.append('ip_address', ip);
-        fetch('admin.php', { method: 'POST', body: fd })
-            .then(r => r.json())
-            .then(d => {
-                if (d.status === 'success') { showToast(d.message); refreshData(); }
-                else showToast(d.message, 'error');
-            });
-    };
-}
-
-function updateBannedIps(ips) {
-    const tbody = document.getElementById('bannedIpsList');
-    if (!ips || ips.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#94a3b8">هیچ IP مسدودی وجود ندارد</td></tr>';
-        return;
-    }
-    let html = '';
-    ips.forEach(ip => {
-        html += `<tr>
-            <td style="direction:ltr;font-family:monospace;color:#f87171">${ip.ip_address}</td>
-            <td>${ip.reason || '-'}</td>
-            <td style="font-size:0.8rem;color:#94a3b8">${ip.banned_at || '-'}</td>
-            <td><button onclick="unbanIpAction('${ip.ip_address}')" class="btn btn-success btn-sm">رفع بن</button></td>
-        </tr>`;
-    });
-    if (tbody.innerHTML !== html) tbody.innerHTML = html;
-}
-
-function viewUserSessions(userId, username) {
-    document.getElementById('sessionsModalTitle').textContent = 'نشست‌های فعال: ' + username;
-    document.getElementById('sessionsModalBody').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">در حال بارگذاری...</div>';
-    document.getElementById('sessionsModal').style.display = 'flex';
-    
-    const fd = new FormData();
-    fd.append('action', 'get_user_sessions');
-    fd.append('user_id', userId);
-    fd.append('csrf_token', csrfToken);
-    
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status !== 'success') { showToast(d.message, 'error'); return; }
-            const sessions = d.sessions || [];
-            if (sessions.length === 0) {
-                document.getElementById('sessionsModalBody').innerHTML = '<div style="text-align:center;color:#94a3b8;padding:20px">هیچ نشست فعالی یافت نشد</div>';
-                return;
-            }
-            let html = `<div style="margin-bottom:10px;display:flex;justify-content:flex-end;">
-                <button onclick="killAllSessions(${userId},'${username}')" class="btn btn-danger btn-sm">🔥 حذف همه نشست‌ها</button>
-            </div>`;
-            sessions.forEach(s => {
-                const isActive = s.is_recent;
-                const statusDot = isActive ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-left:6px;box-shadow:0 0 6px #10b981"></span>' : '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#6b7280;margin-left:6px;"></span>';
-                html += `<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;margin-bottom:8px;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-                        <div>
-                            ${statusDot}<span style="color:${isActive ? '#34d399' : '#94a3b8'};font-size:0.85rem;">${isActive ? 'فعال' : 'غیرفعال'}</span>
-                            <div style="font-family:monospace;font-size:0.8rem;color:#818cf8;margin-top:4px;direction:ltr">${s.ip_address || '-'}</div>
-                            <div style="font-size:0.75rem;color:#64748b;margin-top:2px;">آخرین فعالیت: ${s.last_activity}</div>
-                            <div style="font-size:0.7rem;color:#475569;margin-top:2px;direction:ltr;word-break:break-all;">${s.user_agent ? s.user_agent.substring(0,80)+'...' : '-'}</div>
-                        </div>
-                        <button onclick="killSession(${s.id},'${username}')" class="btn btn-danger btn-sm" style="flex-shrink:0">حذف نشست</button>
-                    </div>
-                </div>`;
-            });
-            document.getElementById('sessionsModalBody').innerHTML = html;
-        })
-        .catch(() => showToast('خطای شبکه', 'error'));
-}
-
-function killSession(sessionId, username) {
-    if (!confirm(`نشست حذف شود و کاربر ${username} از حساب خارج می‌شود؟`)) return;
-    const fd = new FormData();
-    fd.append('action', 'kill_session');
-    fd.append('session_id', sessionId);
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                showToast(d.message);
-                closeModal('sessionsModal');
-                refreshData();
-            } else showToast(d.message, 'error');
-        });
-}
-
-function killAllSessions(userId, username) {
-    if (!confirm(`تمام نشست‌های ${username} حذف شود؟`)) return;
-    const fd = new FormData();
-    fd.append('action', 'kill_all_sessions_user');
-    fd.append('user_id', userId);
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                showToast(d.message);
-                closeModal('sessionsModal');
-                refreshData();
-            } else showToast(d.message, 'error');
-        });
-}
-
-function updateChannelsList(rooms) {
-    const tbody = document.getElementById('channelsList');
-    if (!tbody) return;
-    const channels = rooms.filter(r => r.room_kind === 'channel');
-    if (!channels.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:20px;">کانالی وجود ندارد</td></tr>';
-        return;
-    }
-    tbody.innerHTML = channels.map(r => {
-        const typeLabel = r.type === 'public' ? '<span style="background:rgba(16,185,129,0.15);color:#34d399;padding:2px 10px;border-radius:8px;font-size:12px;">عمومی 📢</span>' : '<span style="background:rgba(99,102,241,0.15);color:#a5b4fc;padding:2px 10px;border-radius:8px;font-size:12px;">خصوصی 🔐</span>';
-        const invCode = r.invite_code ? `<span style="font-family:monospace;font-size:12px;color:#818cf8;background:rgba(99,102,241,0.1);padding:2px 8px;border-radius:6px;cursor:pointer;" onclick="navigator.clipboard.writeText('${r.invite_code}').then(()=>showToast('کپی شد'))">${r.invite_code}</span>` : '—';
-        return `<tr>
-            <td style="font-weight:bold;">📢 ${escapeAdminHtml(r.name)}</td>
-            <td>${typeLabel}</td>
-            <td>${r.category ? escapeAdminHtml(r.category) : '—'}</td>
-            <td>${invCode}</td>
-            <td>${escapeAdminHtml(r.creator || 'سیستم')}</td>
-            <td><button onclick="deleteChannelAdmin(${r.id},'${escapeAdminHtml(r.name)}')" class="btn btn-danger btn-sm">🗑 حذف</button></td>
-        </tr>`;
-    }).join('');
-}
-
-function createChannel() {
-    const name = document.getElementById('newChannelName').value.trim();
-    const type = document.getElementById('newChannelType').value;
-    const cat  = document.getElementById('newChannelCat').value.trim();
-    if (!name) return showToast('نام کانال را وارد کنید', 'error');
-    performActionCustom('create_channel', { name, type, category: cat }, d => {
-        showToast(d.message);
-        document.getElementById('newChannelName').value = '';
-        document.getElementById('newChannelCat').value = '';
-        refreshData();
-    });
-}
-
-function deleteChannelAdmin(id, name) {
-    if (!confirm(`کانال "${name}" حذف شود؟`)) return;
-    performAction('delete_channel', id);
-    setTimeout(refreshData, 700);
-}
-
-function loadAdminsList() {
-    const tbody = document.getElementById('adminsList');
-    if (!tbody) return;
-    const fd = new FormData();
-    fd.append('action', 'list_admins');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status !== 'success') return;
-            if (!d.admins.length) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:20px;">هیچ ادمین فرعی ثبت نشده</td></tr>';
-                return;
-            }
-            tbody.innerHTML = d.admins.map(a => {
-                const activeLabel = a.is_active == 1 ? '<span style="color:#34d399;font-size:12px;">✔ فعال</span>' : '<span style="color:#ef4444;font-size:12px;">✕ غیرفعال</span>';
-                const lastLogin = a.last_login ? a.last_login.substr(0, 16) : 'هرگز';
-                const isFull = (a.level === 'full');
-                const levelBadge = isFull
-                    ? '<span style="display:inline-block;background:rgba(99,102,241,0.18);border:1px solid rgba(99,102,241,0.4);color:#a5b4fc;border-radius:999px;padding:2px 10px;font-size:11px;">🛡 کامل</span>'
-                    : '<span style="display:inline-block;background:rgba(245,158,11,0.14);border:1px solid rgba(245,158,11,0.35);color:#fbbf24;border-radius:999px;padding:2px 10px;font-size:11px;">👁 محدود</span>';
-                const nextLevel = isFull ? 'limited' : 'full';
-                return `<tr>
-                    <td style="font-weight:bold;font-family:monospace;">${escapeAdminHtml(a.username)}</td>
-                    <td>${escapeAdminHtml(a.display_name || '—')}</td>
-                    <td>${levelBadge}</td>
-                    <td style="font-size:12px;color:#64748b;">${lastLogin}</td>
-                    <td>${activeLabel}</td>
-                    <td style="display:flex;gap:6px;">
-                        <button onclick="setAdminLevel(${a.id},'${escapeAdminHtml(a.username)}','${nextLevel}')" class="btn btn-sm" style="background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);" title="تغییر سطح دسترسی">${isFull ? 'محدود کن' : 'کامل کن'}</button>
-                        <button onclick="toggleAdminActive(${a.id})" class="btn btn-sm" style="background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);">${a.is_active ? 'غیرفعال' : 'فعال'}</button>
-                        <button onclick="removeAdmin(${a.id},'${escapeAdminHtml(a.username)}')" class="btn btn-danger btn-sm">🗑</button>
-                    </td>
-                </tr>`;
-            }).join('');
-        });
-}
-
-function loadSocialSettings() {
-    performActionCustom('get_social_settings', {}, d => {
-        if (d.status !== 'success') return;
-        document.getElementById('socialEnabled').checked = !!d.enabled;
-        document.getElementById('socialGithubOn').checked = !!d.github_on;
-        document.getElementById('socialWebsiteOn').checked = !!d.website_on;
-        document.getElementById('socialTelegramOn').checked = !!d.telegram_on;
-        document.getElementById('socialGithubLink').value = d.github || '';
-        document.getElementById('socialWebsiteLink').value = d.website || '';
-        document.getElementById('socialTelegramLink').value = d.telegram || '';
-    });
-}
-function saveSocialSettings() {
-    performActionCustom('save_social_settings', {
-        enabled: document.getElementById('socialEnabled').checked ? '1' : '0',
-        github_on: document.getElementById('socialGithubOn').checked ? '1' : '0',
-        website_on: document.getElementById('socialWebsiteOn').checked ? '1' : '0',
-        telegram_on: document.getElementById('socialTelegramOn').checked ? '1' : '0',
-        github: document.getElementById('socialGithubLink').value.trim(),
-        website: document.getElementById('socialWebsiteLink').value.trim(),
-        telegram: document.getElementById('socialTelegramLink').value.trim()
-    }, d => showToast(d.message));
-}
-
-function saveAdminDisplayName() {
-    const v = document.getElementById('adminDisplayNameInput').value.trim();
-    if (!v) return showToast('نام نمایشی را وارد کنید', 'error');
-    performActionCustom('save_admin_display', { display_name: v }, d => showToast(d.message));
-}
-
-function addAdmin() {
-    const uname = document.getElementById('newAdminUser').value.trim();
-    const pass  = document.getElementById('newAdminPass').value;
-    const dname = document.getElementById('newAdminDisplay').value.trim();
-    const level = (document.getElementById('newAdminLevel') || {}).value || 'limited';
-    if (!uname || !pass) return showToast('نام کاربری و رمز عبور الزامی است', 'error');
-    if (pass.length < 8) return showToast('رمز عبور باید حداقل ۸ کاراکتر باشد', 'error');
-    performActionCustom('add_admin', { username: uname, password: pass, display_name: dname, level }, d => {
-        showToast(d.message);
-        document.getElementById('newAdminUser').value = '';
-        document.getElementById('newAdminPass').value = '';
-        document.getElementById('newAdminDisplay').value = '';
-        loadAdminsList();
-    });
-}
-
-function setAdminLevel(id, name, level) {
-    const label = level === 'full' ? 'کامل' : 'محدود';
-    if (!confirm(`سطح دسترسی «${name}» به «${label}» تغییر کند؟`)) return;
-    performActionCustom('set_admin_level', { admin_id: id, level }, d => {
-        showToast(d.message);
-        loadAdminsList();
-    });
-}
-
-function removeAdmin(id, name) {
-    if (!confirm(`ادمین "${name}" حذف شود؟`)) return;
-    performActionCustom('remove_admin', { admin_id: id }, d => { showToast(d.message); loadAdminsList(); });
-}
-
-function toggleAdminActive(id) {
-    performActionCustom('toggle_admin_active', { admin_id: id }, d => { showToast(d.message); loadAdminsList(); });
-}
-
-let _hideAdminOnlineState = false;
-function loadHideAdminOnlineState() {
-    const btn = document.getElementById('hideAdminOnlineBtn');
-    if (!btn) return;
-    // use performActionCustom to get current state
-    const fd = new FormData();
-    fd.append('action', 'get_hide_admin_state');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                _hideAdminOnlineState = d.state == 1;
-                btn.textContent = _hideAdminOnlineState ? '✔ آنلاین مخفی است — کلیک برای نمایش' : '👁 نمایش آنلاین — کلیک برای مخفی کردن';
-                btn.className = _hideAdminOnlineState ? 'btn btn-success' : 'btn btn-primary';
-                btn.disabled = false;
-            }
-        })
-        .catch(() => {
-            btn.textContent = '👁 وضعیت آنلاین ادمین';
-            btn.disabled = false;
-        });
-}
-
-function toggleHideAdminOnline() {
-    performActionCustom('toggle_hide_admin_online', {}, d => {
-        showToast(d.message);
-        _hideAdminOnlineState = (d.state == 1);
-        const btn = document.getElementById('hideAdminOnlineBtn');
-        if (btn) {
-            btn.textContent = _hideAdminOnlineState ? '✔ آنلاین مخفی است — کلیک برای نمایش' : '👁 نمایش آنلاین — کلیک برای مخفی کردن';
-            btn.className = _hideAdminOnlineState ? 'btn btn-success' : 'btn btn-primary';
-        }
-    });
-}
-
-// ── Demo mode ───────────────────────────────────────────────────────────────
-function loadAccessState() {
-    const fd = new FormData();
-    fd.append('action', 'get_access_state');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status !== 'success') return;
-            applyAccessState(d.lock_register == 1, d.lock_login == 1);
-        })
-        .catch(() => {});
-}
-
-function applyAccessState(reg, login) {
-    const regCb = document.getElementById('lockRegisterToggle');
-    const logCb = document.getElementById('lockLoginToggle');
-    if (regCb) regCb.checked = !!reg;
-    if (logCb) logCb.checked = !!login;
-
-    const regPill = document.getElementById('accessRegPill');
-    if (regPill) {
-        regPill.dataset.on = reg ? '1' : '0';
-        regPill.textContent = reg ? 'ثبت‌نام بسته' : 'ثبت‌نام باز';
-    }
-    const logPill = document.getElementById('accessLoginPill');
-    if (logPill) {
-        logPill.dataset.on = login ? '1' : '0';
-        logPill.textContent = login ? 'ورود بسته' : 'ورود باز';
-    }
-}
-
-function toggleAccessLock(kind, on) {
-    const action = (kind === 'register') ? 'toggle_register_lock' : 'toggle_login_lock';
-    const fd = new FormData();
-    fd.append('action', action);
-    fd.append('enabled', on ? '1' : '0');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status !== 'success') {
-                showToast(d.message || 'خطا');
-                loadAccessState();
-                return;
-            }
-            showToast(d.message || 'ذخیره شد');
-            loadAccessState();
-        })
-        .catch(() => { showToast('خطا در ارتباط'); loadAccessState(); });
-}
-
-function loadDemoState() {
-    const fd = new FormData();
-    fd.append('action', 'get_demo_state');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status !== 'success') return;
-            const on = d.enabled == 1;
-            const cb = document.getElementById('demoEnabled');
-            if (cb) cb.checked = on;
-            const dot = document.getElementById('demoStatusDot');
-            const lbl = document.getElementById('demoStatusLabel');
-            if (dot) dot.style.background = on ? '#34d399' : '#64748b';
-            if (lbl) {
-                lbl.textContent = on ? 'فعال' : 'غیرفعال';
-                lbl.style.color = on ? '#34d399' : 'var(--text-muted)';
-            }
-            const ac = document.getElementById('demoActiveCount');
-            if (ac) ac.textContent = d.active;
-        })
-        .catch(() => {});
-}
-
-function toggleDemoMode(on) {
-    const fd = new FormData();
-    fd.append('action', 'toggle_demo_mode');
-    fd.append('enabled', on ? '1' : '0');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status !== 'success') { showToast(d.message || 'خطا'); loadDemoState(); return; }
-            showToast(d.message);
-            loadDemoState();
-        })
-        .catch(() => { showToast('خطا در ارتباط'); loadDemoState(); });
-}
-
-function purgeDemoData() {
-    if (!confirm('همه حساب‌های نمایشی و تمام پیام‌هایشان حذف می‌شوند. ادامه می‌دهید؟')) return;
-    const btn = document.getElementById('demoPurgeBtn');
-    if (btn) { btn.disabled = true; btn.textContent = 'در حال پاکسازی…'; }
-    const fd = new FormData();
-    fd.append('action', 'purge_demo_data');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            showToast(d.message || 'انجام شد');
-            loadDemoState();
-        })
-        .catch(() => showToast('خطا در ارتباط'))
-        .finally(() => {
-            if (btn) { btn.disabled = false; btn.textContent = '🗑 پاکسازی فوری همه داده‌های دمو'; }
-        });
-}
-
-function loadUpdateNotifs() {
-    const tbody = document.getElementById('updateNotifsList');
-    if (!tbody) return;
-    const fd = new FormData();
-    fd.append('action', 'list_update_notifs');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status !== 'success') return;
-            if (!d.notifications.length) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:20px;">هیچ اطلاعیه‌ای ثبت نشده</td></tr>';
-                return;
-            }
-            const typeColors = { info: '#6366f1', update: '#8b5cf6', success: '#10b981', warning: '#f59e0b' };
-            tbody.innerHTML = d.notifications.map(n => {
-                const col = typeColors[n.type] || '#6366f1';
-                const activeLabel = n.is_active == 1 ? '<span style="color:#34d399;font-size:12px;">✔ فعال</span>' : '<span style="color:#ef4444;font-size:12px;">✕ غیرفعال</span>';
-                return `<tr>
-                    <td style="font-size:22px;text-align:center;">${n.icon}</td>
-                    <td style="font-weight:bold;">${escapeAdminHtml(n.title)}</td>
-                    <td><span style="background:${col}22;color:${col};padding:2px 10px;border-radius:8px;font-size:12px;">${n.type}</span></td>
-                    <td>${activeLabel}</td>
-                    <td style="font-size:12px;color:#64748b;">${(n.created_at || '').substr(0,10)}</td>
-                    <td style="display:flex;gap:4px;">
-                        <button onclick="toggleUpdateNotif(${n.id})" class="btn btn-sm" style="background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);">${n.is_active ? 'غیرفعال' : 'فعال'}</button>
-                        <button onclick="deleteUpdateNotif(${n.id})" class="btn btn-danger btn-sm">🗑</button>
-                    </td>
-                </tr>`;
-            }).join('');
-        });
-}
-
-function addUpdateNotif() {
-    const title = document.getElementById('notifTitle').value.trim();
-    const msg   = document.getElementById('notifMsg').value.trim();
-    const icon  = document.getElementById('notifIcon').value.trim() || '🔔';
-    const type  = document.getElementById('notifType').value;
-    if (!title || !msg) return showToast('عنوان و متن الزامی است', 'error');
-    performActionCustom('add_update_notif', { title, message: msg, icon, type }, d => {
-        showToast(d.message);
-        document.getElementById('notifTitle').value = '';
-        document.getElementById('notifMsg').value = '';
-        document.getElementById('notifIcon').value = '🔔';
-        loadUpdateNotifs();
-    });
-}
-
-function toggleUpdateNotif(id) {
-    performActionCustom('toggle_update_notif', { id }, d => { showToast(d.message); loadUpdateNotifs(); });
-}
-
-function deleteUpdateNotif(id) {
-    if (!confirm('این اطلاعیه حذف شود؟')) return;
-    performActionCustom('delete_update_notif', { id }, d => { showToast(d.message); loadUpdateNotifs(); });
-}
-
-function approveReportAndBan(id) {
-    if (!confirm('گزارش تأیید شده و کاربر بن شود؟')) return;
-    performActionCustom('approve_report_and_ban', { id }, d => { showToast(d.message); refreshData(); });
-}
-
-function performActionCustom(action, data, successCb, retry) {
-    const fd = new FormData();
-    fd.append('action', action);
-    fd.append('csrf_token', csrfToken);
-    for (const k in data) fd.append(k, data[k]);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                // A throwing handler must not fall into the network catch below
-                // and masquerade as a connection failure.
-                try { if (successCb) successCb(d); } catch (e) { console.error('[VIRAX admin] ' + action + ' handler: ' + (e && e.message || e)); }
-            } else showToast(d.message || 'خطا', 'error');
-        })
-        .catch(() => {
-            // Page-load hand-off (chat long-poll abort, connection churn) can
-            // kill a single init request — one silent retry before alarming
-            // the admin, so the panel never opens with a phantom error toast.
-            if (!retry) { performActionCustom(action, data, successCb, true); return; }
-            showToast('خطا در ارتباط', 'error');
-        });
-}
-
-function escapeAdminHtml(str) {
-    if (!str) return '';
-    return String(str).replace(/[&<>'"]/g, t => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t]));
-}
-
-function setWsStatusDot(status) {
-    const dot = document.getElementById('wsStatusDot');
-    const label = document.getElementById('wsStatusLabel');
-    if (!dot || !label) return;
-    if (status === 'online') {
-        dot.style.background = '#10b981';
-        label.textContent = 'متصل';
-        label.style.color = '#34d399';
-    } else if (status === 'offline') {
-        dot.style.background = '#ef4444';
-        label.textContent = 'قطع';
-        label.style.color = '#f87171';
-    } else {
-        dot.style.background = '#64748b';
-        label.textContent = 'بررسی نشده';
-        label.style.color = 'var(--text-muted)';
-    }
-}
-
-function togglePassVisibility(inputId, btn) {
-    const el = document.getElementById(inputId);
-    if (!el) return;
-    const show = el.type === 'password';
-    el.type = show ? 'text' : 'password';
-    btn.textContent = show ? '🙈' : '👁';
-    btn.setAttribute('aria-label', show ? 'پنهان کردن' : 'نمایش');
-}
-
-function loadAiSettings() {
-    performActionCustom('get_ai_settings', {}, d => {
-        document.getElementById('aiEnabled').checked = !!d.ai_enabled;
-        document.getElementById('aiBaseUrl').value = d.ai_base_url || '';
-        document.getElementById('aiModel').value = d.ai_model || '';
-        document.getElementById('aiSystemPrompt').value = d.ai_system_prompt || '';
-        document.getElementById('aiBehavior').value = d.ai_behavior || '';
-        document.getElementById('aiMaxTokens').value = d.ai_max_tokens || 800;
-        document.getElementById('aiTemperature').value = d.ai_temperature ?? 0.7;
-        document.getElementById('aiTimeout').value = d.ai_timeout || 30;
-        document.getElementById('aiCooldown').value = d.ai_cooldown ?? 5;
-        document.getElementById('aiMaxAttempts').value = d.ai_max_attempts ?? 3;
-        document.getElementById('aiRooms').value = d.ai_rooms || '';
-        document.getElementById('aiAllRooms').checked = (d.ai_all_rooms !== false);
-        document.getElementById('aiPv').checked = (d.ai_pv !== false);
-        document.getElementById('aiUserLimitCount').value = d.ai_user_limit_count ?? 0;
-        document.getElementById('aiUserLimitWindow').value = d.ai_user_limit_window ?? 0;
-        document.getElementById('aiKeyword').value = d.ai_keyword || 'ویراکس';
-        // Stored key is "mention_only" (strict); the toggle is its inverse.
-        document.getElementById('aiReplyAll').checked = (d.ai_mention_only === false);
-        document.getElementById('aiKeyMasked').textContent = d.ai_api_key_set ? ('کلید فعلی: ' + d.ai_api_key_masked) : 'کلیدی ذخیره نشده است';
-    });
-}
-
-function saveAiSettings() {
-    const data = {
-        ai_enabled: document.getElementById('aiEnabled').checked ? '1' : '0',
-        ai_base_url: document.getElementById('aiBaseUrl').value.trim(),
-        ai_model: document.getElementById('aiModel').value.trim(),
-        ai_system_prompt: document.getElementById('aiSystemPrompt').value.trim(),
-        ai_behavior: document.getElementById('aiBehavior').value.trim(),
-        ai_max_tokens: document.getElementById('aiMaxTokens').value || 800,
-        ai_temperature: document.getElementById('aiTemperature').value ?? 0.7,
-        ai_timeout: document.getElementById('aiTimeout').value || 60,
-        ai_cooldown: document.getElementById('aiCooldown').value ?? 5,
-        ai_max_attempts: document.getElementById('aiMaxAttempts').value ?? 3,
-        ai_rooms: document.getElementById('aiRooms').value.trim(),
-        ai_all_rooms: document.getElementById('aiAllRooms').checked ? '1' : '0',
-        ai_pv: document.getElementById('aiPv').checked ? '1' : '0',
-        ai_mention_only: document.getElementById('aiReplyAll').checked ? '0' : '1',
-        ai_user_limit_count: document.getElementById('aiUserLimitCount').value || 0,
-        ai_user_limit_window: document.getElementById('aiUserLimitWindow').value || 0,
-        ai_keyword: document.getElementById('aiKeyword').value.trim()
-    };
-    const key = document.getElementById('aiApiKey').value.trim();
-    if (key) data.ai_api_key = key;
-    performActionCustom('save_ai_settings', data, d => {
-        showToast(d.message);
-        document.getElementById('aiApiKey').value = '';
-        loadAiSettings();
-    });
-}
-
-function testAiConnection() {
-    const data = {
-        ai_base_url: document.getElementById('aiBaseUrl').value.trim(),
-        ai_model: document.getElementById('aiModel').value.trim(),
-        ai_max_tokens: document.getElementById('aiMaxTokens').value || 800,
-        ai_timeout: document.getElementById('aiTimeout').value || 60
-    };
-    const key = document.getElementById('aiApiKey').value.trim();
-    if (key) data.ai_api_key = key;
-    const fd = new FormData();
-    fd.append('action', 'test_ai_connection');
-    fd.append('csrf_token', csrfToken);
-    for (const k in data) fd.append(k, data[k]);
-    const toast = showToast('در حال تست اتصال...', 'info');
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            showToast(d.message, d.status === 'success' ? 'success' : 'error');
-        })
-        .catch(() => showToast('خطا در تست اتصال', 'error'));
-}
-
-function createBackup(kind) {
-    performActionCustom('create_backup', { kind }, d => {
-        showToast(d.message);
-        loadBackupList();
-    });
-}
-
-function loadBackupList() {
-    performActionCustom('get_backup_list', {}, d => {
-        const wrap = document.getElementById('backupList');
-        if (!wrap) return;
-        if (!d.backups || d.backups.length === 0) {
-            wrap.innerHTML = '<div style="color:var(--text-muted); font-size:0.85rem; text-align:center; padding:14px;">هنوز پشتیبانی ساخته نشده است</div>';
-            return;
-        }
-        wrap.innerHTML = d.backups.map(b => {
-            const kb = Math.max(1, Math.round(b.size / 1024));
-            const sizeLabel = kb > 1024 ? (kb / 1024).toFixed(1) + ' MB' : kb + ' KB';
-            const when = new Date(b.mtime * 1000).toLocaleString('fa-IR');
-            return `<div style="display:flex; align-items:center; justify-content:space-between; gap:10px; background:rgba(0,0,0,0.2); border:1px solid var(--border); border-radius:10px; padding:10px 14px; flex-wrap:wrap;">
-                <span style="font-family:monospace; font-size:0.82rem; color:#a5b4fc; direction:ltr;">${b.name}</span>
-                <span style="font-size:0.8rem; color:var(--text-muted);">${sizeLabel} • ${when}</span>
-                <span style="display:flex; gap:6px;">
-                    <button class="btn btn-ghost btn-sm" onclick="downloadBackup('${b.name}')">⬇ دانلود</button>
-                    <button class="btn btn-ghost btn-sm" style="color:#f87171;" onclick="deleteBackup('${b.name}')">🗑 حذف</button>
-                </span>
-            </div>`;
-        }).join('');
-    });
-}
-
-function downloadBackup(name) {
-    const fd = new FormData();
-    fd.append('action', 'download_backup');
-    fd.append('csrf_token', csrfToken);
-    fd.append('filename', name);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.ok ? r.blob() : Promise.reject())
-        .then(blob => {
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = name;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 4000);
-        })
-        .catch(() => showToast('دانلود ناموفق بود', 'error'));
-}
-
-function deleteBackup(name) {
-    if (!confirm('این پشتیبان حذف شود؟ ' + name)) return;
-    performActionCustom('delete_backup', { filename: name }, d => {
-        showToast(d.message);
-        loadBackupList();
-    });
-}
-
-function resetBackups() {
-    if (!confirm('⚠️ همه‌ی فایل‌های پشتیبان و تاریخچه‌ی آن‌ها حذف شوند؟ این کار قابل بازگشت نیست.')) return;
-    if (!confirm('مطمئنید؟ آخرین پشتیبان‌ها هم پاک می‌شوند و دیگر نسخه‌ای برای بازگردانی نمی‌ماند.')) return;
-    performActionCustom('reset_backups', {}, d => {
-        showToast(d.message);
-        loadBackupList();
-    });
-}
-
-function loadWsSettings() {
-    performActionCustom('get_ws_settings', {}, d => {
-        const en = document.getElementById('wsEnabled');
-        if (en) en.checked = !!d.ws_enabled;
-        document.getElementById('wsUrl').value = d.ws_url || '';
-        document.getElementById('wsInternalUrl').value = d.ws_internal_url || '';
-        document.getElementById('wsOrigins').value = d.ws_origins || '*';
-        document.getElementById('wsReconnect').value = d.ws_reconnect || 5;
-        updateWsEndpointDisplay();
-        if (d.ws_enabled && (d.ws_url || d.ws_internal_url)) {
-            testWsConnection(true);
-        }
-    });
-}
-
-function updateWsEndpointDisplay() {
-    const el = document.getElementById('wsEndpointDisplay');
-    if (!el) return;
-    const url = document.getElementById('wsUrl').value.trim();
-    el.textContent = url || 'آدرس عمومی تنظیم نشده — کاربران در حالت عادی چت می‌کنند';
-}
-
-function copyWsEndpoint() {
-    const url = document.getElementById('wsUrl').value.trim();
-    if (!url) return showToast('ابتدا آدرس WebSocket را ذخیره کنید', 'error');
-    navigator.clipboard.writeText(url).then(() => showToast('آدرس WebSocket کپی شد'));
-}
-
-function saveWsSettings() {
-    const data = {
-        ws_enabled: document.getElementById('wsEnabled').checked ? '1' : '0',
-        ws_url: document.getElementById('wsUrl').value.trim(),
-        ws_internal_url: document.getElementById('wsInternalUrl').value.trim(),
-        ws_origins: document.getElementById('wsOrigins').value.trim() || '*',
-        ws_reconnect: document.getElementById('wsReconnect').value || 5
-    };
-    performActionCustom('save_ws_settings', data, d => {
-        showToast(d.message);
-        updateWsEndpointDisplay();
-    });
-}
-
-function testWsConnection(silent) {
-    setWsStatusDot('checking');
-    const fd = new FormData();
-    fd.append('action', 'test_ws_connection');
-    fd.append('csrf_token', csrfToken);
-    fetch('admin.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(d => {
-            if (d.status === 'success') {
-                setWsStatusDot('online');
-                if (!silent) showToast(d.message + (d.clients !== null && d.clients !== undefined ? ' (' + d.clients + ' کلاینت)' : ''));
-            } else {
-                setWsStatusDot('offline');
-                if (!silent) showToast(d.message, 'error');
-            }
-        })
-        .catch(() => {
-            setWsStatusDot('offline');
-            if (!silent) showToast('خطا در بررسی اتصال', 'error');
-        });
-}
-
-document.addEventListener('DOMContentLoaded', function() {
-    loadWsSettings();
-    loadAiSettings();
-    loadBackupList();
-    if (document.getElementById('socialCard')) loadSocialSettings();
-    const wsUrlInput = document.getElementById('wsUrl');
-    if (wsUrlInput) wsUrlInput.addEventListener('input', updateWsEndpointDisplay);
-});
-
-function toggleAdminNav() {
-    const d = document.getElementById('adminNavDrawer');
-    const b = document.getElementById('adminNavBackdrop');
-    if (!d) return;
-    const open = !d.classList.contains('open');
-    d.classList.toggle('open', open);
-    if (b) b.classList.toggle('open', open);
-    document.body.style.overflow = open ? 'hidden' : '';
-}
-
-function closeAdminNav() {
-    const d = document.getElementById('adminNavDrawer');
-    const b = document.getElementById('adminNavBackdrop');
-    if (d) d.classList.remove('open');
-    if (b) b.classList.remove('open');
-    document.body.style.overflow = '';
-}
-
-function initAdminNav() {
-    const list = document.getElementById('adminNavList');
-    if (!list || list.childElementCount) return;
-    const cards = [].filter.call(document.querySelectorAll('.container .card'), function (c) {
-        return c.offsetParent !== null && c.querySelector('.card-title');
-    });
-    const items = [];
-    cards.forEach(function (c, i) {
-        const t = c.querySelector('.card-title');
-        if (!c.id) c.id = 'admin-card-' + i;
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'admin-nav-item';
-        btn.setAttribute('data-target', c.id);
-        btn.innerHTML = '<span class="dot"></span><span>' + t.textContent.trim() + '</span>';
-        btn.onclick = function () {
-            closeAdminNav();
-            setTimeout(function () { c.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 120);
-        };
-        list.appendChild(btn);
-        items.push(btn);
-    });
-    if (!items.length) return;
-    if ('IntersectionObserver' in window) {
-        const obs = new IntersectionObserver(function (entries) {
-            entries.forEach(function (en) {
-                if (en.isIntersecting) {
-                    items.forEach(function (b) {
-                        b.classList.toggle('active', b.getAttribute('data-target') === en.target.id);
-                    });
-                }
-            });
-        }, { rootMargin: '-15% 0px -70% 0px', threshold: 0 });
-        cards.forEach(function (c) { obs.observe(c); });
-    }
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeAdminNav(); });
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initAdminNav);
-} else {
-    initAdminNav();
-}
-
-var AP_PRESETS = ['#6366f1','#3b82f6','#0ea5e9','#06b6d4','#14b8a6','#10b981','#84cc16','#eab308','#f59e0b','#f97316','#ef4444','#ec4899','#8b5cf6','#d946ef','#f43f5e','#64748b'];
-var AP_STEPS = [0.9, 1, 1.1, 1.2, 1.3];
-var AP_LABELS = ['۹۰٪', '۱۰۰٪', '۱۱۰٪', '۱۲۰٪', '۱۳۰٪'];
-
-function apBuild() {
-    var grid = document.getElementById('apSwatches');
-    if (!grid || grid.childElementCount) return;
-    grid.innerHTML = AP_PRESETS.map(function (c) {
-        return '<button type="button" class="ap-sw" data-c="' + c + '" style="background:' + c + '" onclick="apPick(\'' + c + '\')" aria-label="' + c + '"></button>';
-    }).join('');
-}
-
-function apSync(color) {
-    var c = String(color || '').toLowerCase();
-    var dots = document.querySelectorAll('#apSwatches .ap-sw');
-    for (var i = 0; i < dots.length; i++) dots[i].classList.toggle('active', dots[i].getAttribute('data-c') === c);
-    var dot = document.getElementById('apCustomDot');
-    if (dot) dot.style.background = c || '#6366f1';
-    var inp = document.getElementById('apColorInput');
-    if (inp && c && inp.value !== c) inp.value = c;
-}
-window.veyraxSyncSwatches = apSync;
-
-function apSyncScale(scale) {
-    var v = parseFloat(scale) || 1;
-    var idx = 1;
-    for (var i = 0; i < AP_STEPS.length; i++) { if (Math.abs(AP_STEPS[i] - v) < 0.01) { idx = i; break; } }
-    var range = document.getElementById('apFsRange');
-    if (range && parseInt(range.value, 10) !== idx) range.value = idx;
-    if (range) range.style.setProperty('--ap-fill', (idx / (AP_STEPS.length - 1) * 100) + '%');
-    var lab = document.getElementById('apFsLabel');
-    if (lab) lab.textContent = AP_LABELS[idx];
-}
-window.veyraxSyncScale = apSyncScale;
-
-function apPick(color) { veyraxApplyTheme(color); }
-
-function apPickCustom(color) {
-    if (!/^#[0-9a-fA-F]{6}$/.test(color)) return;
-    veyraxApplyTheme(color.toLowerCase());
-}
-
-function apSetFont(idx) {
-    var i = Math.max(0, Math.min(AP_STEPS.length - 1, parseInt(idx, 10) || 0));
-    veyraxApplyFontScale(AP_STEPS[i]);
-    apSyncScale(AP_STEPS[i]);
-}
-
-function apStepFont(delta) {
-    var st = window.veyraxThemeState ? window.veyraxThemeState() : { scale: 1 };
-    var i = 1;
-    for (var k = 0; k < AP_STEPS.length; k++) { if (Math.abs(AP_STEPS[k] - st.scale) < 0.01) { i = k; break; } }
-    apSetFont(i + delta);
-}
-
-function apReset() {
-    veyraxResetTheme();
-    var st = window.veyraxThemeState ? window.veyraxThemeState() : { color: '#6366f1', scale: 1 };
-    apSync(st.color);
-    apSyncScale(st.scale);
-}
-
-document.addEventListener('DOMContentLoaded', function () {
-    var st = window.veyraxThemeState ? window.veyraxThemeState() : { color: '#6366f1', scale: 1 };
-    apBuild();
-    apSync(st.color);
-    apSyncScale(st.scale);
-});
-
-var VX_ADMIN_CACHE_CFG = { epoch: 0, ttl: 86400000 };
-
-function netPost(action, data) {
-    var fd = new FormData();
-    fd.append('action', action);
-    fd.append('csrf_token', csrfToken);
-    Object.keys(data || {}).forEach(function (k) { fd.append(k, data[k]); });
-    return fetch('admin.php', { method: 'POST', body: fd }).then(function (r) { return r.json(); });
-}
-
-function loadRuntimeSettings() {
-    netPost('get_runtime_settings').then(function (d) {
-        if (!d || d.status !== 'success') return;
-        var tg = document.getElementById('reqModeTelegram');
-        var nm = document.getElementById('reqModeNormal');
-        if (tg && nm) {
-            if (d.request_mode === 'normal') nm.checked = true; else tg.checked = true;
-        }
-        var ttl = document.getElementById('cacheTtlInput');
-        if (ttl) ttl.value = d.cache_ttl_hours || 24;
-        VX_ADMIN_CACHE_CFG.epoch = d.cache_epoch || 0;
-        VX_ADMIN_CACHE_CFG.ttl = (d.cache_ttl_hours || 24) * 3600 * 1000;
-        if (window.VXCache) {
-            VXCache.configure({ ttl: VX_ADMIN_CACHE_CFG.ttl, version: 'admin', epoch: VX_ADMIN_CACHE_CFG.epoch });
-        }
-        refreshCacheStats();
-    }).catch(function () {});
-}
-
-function refreshCacheStats() {
-    if (!window.VXCache) return;
-    var s = VXCache.stats();
-    var e = document.getElementById('nsEntries');
-    var z = document.getElementById('nsSize');
-    var a = document.getElementById('nsAge');
-    var ep = document.getElementById('nsEpoch');
-    if (e) e.textContent = s.entries;
-    if (z) z.textContent = (s.bytes < 1024 ? s.bytes + ' B' : (s.bytes / 1024).toFixed(1) + ' KB');
-    if (a) a.textContent = s.oldest ? timeAgoFa(s.oldest) : '—';
-    if (ep) ep.textContent = VX_ADMIN_CACHE_CFG.epoch;
-}
-
-function timeAgoFa(ts) {
-    var diff = Math.max(0, Date.now() - ts);
-    var m = Math.floor(diff / 60000);
-    if (m < 1) return 'همین حالا';
-    if (m < 60) return m + ' دقیقه';
-    var h = Math.floor(m / 60);
-    if (h < 24) return h + ' ساعت';
-    return Math.floor(h / 24) + ' روز';
-}
-
-function saveRuntimeSettings() {
-    var mode = 'telegram';
-    var nm = document.getElementById('reqModeNormal');
-    if (nm && nm.checked) mode = 'normal';
-    var ttl = parseInt(document.getElementById('cacheTtlInput').value, 10) || 24;
-    netPost('save_runtime_settings', { request_mode: mode, cache_ttl_hours: ttl }).then(function (d) {
-        if (d && d.status === 'success') {
-            VX_ADMIN_CACHE_CFG.ttl = ttl * 3600 * 1000;
-            if (window.VXUI) VXUI.toast(d.message || 'ذخیره شد', 'success');
-            else if (window.showToast) showToast(d.message || 'ذخیره شد');
-            refreshCacheStats();
-        } else {
-            var msg = (d && d.message) || 'خطا در ذخیره';
-            if (window.VXUI) VXUI.toast(msg, 'error'); else if (window.showToast) showToast(msg);
-        }
-    }).catch(function () {
-        if (window.VXUI) VXUI.toast('ارتباط برقرار نشد', 'error');
-    });
-}
-
-function purgeLocalCache() {
-    var run = function () {
-        if (window.VXCache) VXCache.clearAll();
-        refreshCacheStats();
-        if (window.VXUI) VXUI.toast('کش این مرورگر پاک شد', 'success');
-        else if (window.showToast) showToast('کش این مرورگر پاک شد');
-    };
-    if (window.VXUI && VXUI.confirm) {
-        VXUI.confirm({ title: 'پاک‌سازی کش', text: 'داده‌های ذخیره‌شده در این مرورگر حذف می‌شود. ادامه می‌دهید؟', confirmText: 'پاک کن' }).then(function (ok) { if (ok) run(); });
-    } else run();
-}
-
-function forceReloadCache() {
-    var run = function () {
-        if (window.VXCache) VXCache.clearAll();
-        try { localStorage.setItem('vx_force_reload', String(Date.now())); } catch (e) {}
-        location.reload();
-    };
-    if (window.VXUI && VXUI.confirm) {
-        VXUI.confirm({ title: 'بازخوانی اجباری', text: 'کش پاک می‌شود و صفحه با داده‌های تازه از سرور بارگذاری می‌شود.', confirmText: 'بارگذاری مجدد' }).then(function (ok) { if (ok) run(); });
-    } else run();
-}
-
-function bumpCacheEpoch() {
-    if (window.VXUI && VXUI.confirm) {
-        VXUI.confirm({
-            title: 'پاک‌سازی کش همه کاربران',
-            html: 'کش ذخیره‌شده روی <b>همه دستگاه‌ها</b> در اولین بازدید بعدی پاک می‌شود.<br>این عملیات برای کاربران فقط یک بار بارگذاری تازه ایجاد می‌کند.',
-            danger: true,
-            confirmText: 'پاک‌سازی کن'
-        }).then(function (ok) { if (ok) doBumpEpoch(); });
-    } else if (confirm('کش همه کاربران پاک شود؟')) doBumpEpoch();
-}
-
-function doBumpEpoch() {
-    netPost('bump_cache_epoch').then(function (d) {
-        if (d && d.status === 'success') {
-            VX_ADMIN_CACHE_CFG.epoch = d.cache_epoch;
-            if (window.VXCache) VXCache.configure({ epoch: d.cache_epoch, version: 'admin' });
-            refreshCacheStats();
-            if (window.VXUI) VXUI.toast(d.message || 'انجام شد', 'success');
-            else if (window.showToast) showToast(d.message || 'انجام شد');
-        } else {
-            var msg = (d && d.message) || 'خطا';
-            if (window.VXUI) VXUI.toast(msg, 'error'); else if (window.showToast) showToast(msg);
-        }
-    }).catch(function () {
-        if (window.VXUI) VXUI.toast('ارتباط برقرار نشد', 'error');
-    });
-}
-
-document.addEventListener('DOMContentLoaded', function () {
-    if (document.getElementById('networkCard')) {
-        setTimeout(loadRuntimeSettings, 350);
-        setInterval(refreshCacheStats, 15000);
-    }
-});
-
 </script>
+<script src="assets/js/admin.js?v=<?php echo rawurlencode(VEYRAX_ASSET_VERSION); ?>"></script>
 
 <div id="adminNavBackdrop" class="admin-nav-backdrop" onclick="closeAdminNav()"></div>
 <aside id="adminNavDrawer" class="admin-nav-drawer" aria-label="بخش‌های پنل">

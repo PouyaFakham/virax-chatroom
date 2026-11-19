@@ -470,6 +470,23 @@ if ($JSON) {
         $encKey = 'veyrax_' . bin2hex(random_bytes(24));
         $wsSecret = 'ws_' . bin2hex(random_bytes(24));
         $adminDisplay = ($adminDisplayInput !== '') ? $adminDisplayInput : 'مدیر سیستم';
+
+        // The admin password is stored as a bcrypt hash, never as plaintext.
+        // Before 1.9.0 a single leaked data/config.php handed over the panel
+        // directly; a hash makes that read worthless for logging in.
+        $adminHashForCfg = password_hash($adminP, PASSWORD_BCRYPT);
+
+        // Same-origin by default for the realtime server. '*' is what allowed a
+        // page on any other domain to open a socket against this install.
+        $wsOrigin = '';
+        if ($appUrl !== '') {
+            $parts = @parse_url($appUrl);
+            if (is_array($parts) && !empty($parts['host'])) {
+                $wsOrigin = ($parts['scheme'] ?? 'https') . '://' . $parts['host']
+                    . (isset($parts['port']) ? ':' . $parts['port'] : '');
+            }
+        }
+
         $lines = [
             '<?php',
             "define('ENCRYPTION_KEY', " . var_export($encKey, true) . ");",
@@ -481,7 +498,8 @@ if ($JSON) {
             '$db_pass = ' . var_export($pw, true) . ';',
             '$admin_username = ' . var_export($adminU, true) . ';',
             '$admin_display_name = ' . var_export($adminDisplay, true) . ';',
-            '$admin_password = ' . var_export($adminP, true) . ';',
+            '// bcrypt hash — verify with verify_admin_password()',
+            '$admin_password = ' . var_export($adminHashForCfg, true) . ';',
             '$app_name = ' . var_export($siteName, true) . ';',
             '$app_url = ' . var_export($appUrl, true) . ';',
             '$app_timezone = ' . var_export($tz, true) . ';',
@@ -489,8 +507,15 @@ if ($JSON) {
             "\$ws_url = '';",
             "\$ws_internal_url = 'http://127.0.0.1:3000';",
             '$ws_secret = ' . var_export($wsSecret, true) . ';',
-            "\$ws_allowed_origins = '*';",
+            '$ws_allowed_origins = ' . var_export($wsOrigin, true) . ';',
             '$ws_reconnect_interval = 5;',
+            '',
+            '// ── Hardening (1.9.0) ────────────────────────────────────────────────',
+            '$admin_idle_timeout = 3600;',
+            '// CIDR or exact IPs; empty = allow anywhere.',
+            '$admin_ip_allowlist = [];',
+            '$download_ticket_ttl = 120;',
+            '$backup_encryption = true;',
         ];
         $cfg = implode("\n", $lines) . "\n";
         if (!is_dir(__DIR__ . '/data')) @mkdir(__DIR__ . '/data', 0755, true);
@@ -499,10 +524,18 @@ if ($JSON) {
             inst_json_error('نوشتن فایل data/config.php ممکن نشد؛ دسترسی نوشتن پوشه data را بررسی کنید');
         }
         @chmod($cfgPath, 0640);
-        // Block direct web access to the secrets directory on Apache.
-        $dataHt = "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order Deny,Allow\n    Deny from all\n</IfModule>\n";
-        @file_put_contents(__DIR__ . '/data/.htaccess', $dataHt);
         @file_put_contents(__DIR__ . '/data/index.html', '');
+
+        // The directory guards (.htaccess / web.config / index.php) ship with
+        // the package. Report anything missing rather than creating it: the
+        // installer should not be in the business of writing server config.
+        foreach (['data', 'data/backups', 'data/security', 'websocket', 'uploads'] as $guardDir) {
+            $abs = __DIR__ . '/' . $guardDir;
+            if (is_dir($abs) && !is_file($abs . '/.htaccess')) {
+                error_log('[VIRAX] guard missing: ' . $guardDir . '/.htaccess — re-upload it from the package');
+            }
+        }
+
         $lockBody = '<?php exit; ?>' . "\n" . 'veyrax-installed' . "\n";
         if (@file_put_contents($LOCK_FILE, $lockBody) === false) {
             inst_json_error('نوشتن فایل قفل نصب ممکن نشد؛ نصب کامل شد اما قفل نشد. فایل data/veyrax_installed.php را دستی بسازید');

@@ -1,0 +1,74 @@
+# =============================================================================
+#  VIRAX — nginx hardening block (v1.9.0)
+# =============================================================================
+#  nginx does not read .htaccess. If this install runs behind nginx (or behind
+#  Apache-as-proxy with nginx in front), paste the `location` blocks below into
+#  your server block and reload.
+#
+#  Without them, data/config.php, data/backups/*.sql and websocket/server.js are
+#  plain files on the internet. The AES sealing and the signed-download gateway
+#  still protect the *contents*, but nothing should rely on that.
+#
+#  Test before reloading:  nginx -t && systemctl reload nginx
+# =============================================================================
+
+# 1. Secrets, backups, audit trail, realtime source — hard deny.
+location ~ ^/(data|websocket)/ {
+    deny all;
+    return 403;
+}
+
+# 2. Never serve a dotfile.
+location ~ /\.(?!well-known) {
+    deny all;
+    return 403;
+}
+
+# 3. Never serve a dump, log, sealed archive, env file or source map.
+location ~* \.(sql|log|vxb|env|bak|old|orig|ini|bat|cmd|sh|ps1|map|md)$ {
+    deny all;
+    return 403;
+}
+
+# 4. Dependency trees and lockfiles.
+location ~ ^/(.*/)?node_modules/ {
+    deny all;
+    return 403;
+}
+location ~ ^/(composer\.(json|lock)|package(-lock)?\.json|yarn\.lock)$ {
+    deny all;
+    return 403;
+}
+
+# 5. Uploads are inert bytes: no execution, no sniffing, no framing.
+location ^~ /uploads/ {
+    location ~ \.php$ {
+        deny all;
+        return 403;
+    }
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Content-Security-Policy "default-src 'none'; sandbox" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+}
+
+# 6. The panel and the download gateway must never be cached.
+location ~ ^/(admin|admin-login|download|ws_auth)\.php$ {
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+}
+
+# 7. Baseline headers for everything else.
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# 8. Realtime server: keep it on loopback and proxy it, do not expose :3000.
+#
+# location /socket.io/ {
+#     proxy_pass http://127.0.0.1:3000;
+#     proxy_http_version 1.1;
+#     proxy_set_header Upgrade $http_upgrade;
+#     proxy_set_header Connection "upgrade";
+#     proxy_set_header Host $host;
+#     proxy_read_timeout 120s;
+# }

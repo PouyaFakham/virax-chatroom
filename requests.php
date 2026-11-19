@@ -972,7 +972,9 @@ if (isset($_POST['action'])) {
 
         if ($u === $admin_username) {
             $adminPassIn = isset($_POST['password']) && is_string($_POST['password']) ? $_POST['password'] : '';
-            if ($adminPassIn === '' || !hash_equals((string)$admin_password, $adminPassIn)) {
+            // Works for both a bcrypt hash (new installs) and the legacy
+            // plaintext value (installs created before 1.9.0).
+            if ($adminPassIn === '' || !verify_admin_password($adminPassIn, $admin_password)) {
                 veyrax_throttle_record($pdo, $ip, $u, 'login', false);
                 echo json_encode(['status' => 'error', 'message' => 'رمز عبور مدیریت اشتباه است']);
                 exit;
@@ -1177,7 +1179,16 @@ if (isset($_POST['action'])) {
             } catch (Exception $e) {}
 
             if ($isAdminLogin) {
-                setcookie('admin_token', hash('sha256', $admin_password . $ua . 'salt'), time() + 259200, '/', '', isset($_SERVER['HTTPS']), false);
+                // The cookie used to be sha256(password . ua . "salt"), which
+                // meant anyone who read data/config.php could forge it without
+                // knowing the password. It is now an HMAC under the install's
+                // master key, which never leaves the server.
+                $adminToken = hash_hmac(
+                    'sha256',
+                    $ua . '|' . (int)($_SESSION['user_id'] ?? 0) . '|' . $ip,
+                    (string)ENCRYPTION_KEY
+                );
+                setcookie('admin_token', $adminToken, time() + 259200, '/', '', isset($_SERVER['HTTPS']), true);
             }
 
             echo json_encode(['status' => 'success', 'security_code' => $generatedSecurityCode, 'needs_phone' => true]);

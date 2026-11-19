@@ -458,6 +458,7 @@ if (!isset($_SESSION['user_id'])) {
         .login-footer-meta .terms-link:hover { background: rgba(99,102,241,0.14); border-color: rgba(99,102,241,0.4); transform: translateY(-1px); }
         .footer-dot { width: 3px; height: 3px; border-radius: 50%; background: rgba(148,163,184,0.45); flex-shrink: 0; }
         .login-footer-meta .dev-credit {
+            text-decoration: none; cursor: pointer;
             font-family: 'AppBold', sans-serif; font-size: 12px; letter-spacing: 0.4px;
             color: #cbd5e1; padding: 4px 11px; border-radius: 999px;
             background: linear-gradient(160deg, rgba(99,102,241,0.16), rgba(99,102,241,0.06));
@@ -1099,7 +1100,7 @@ if (!isset($_SESSION['user_id'])) {
         <div class="login-footer-meta">
             <span class="terms-link" onclick="openTerms()">پذیرش قوانین</span>
             <span class="footer-dot" aria-hidden="true"></span>
-            <span class="dev-credit" title="<?php echo htmlspecialchars($site_brand_fa, ENT_QUOTES, 'UTF-8'); ?>"><?php echo htmlspecialchars($site_brand_fa, ENT_QUOTES, 'UTF-8'); ?></span>
+            <a class="dev-credit" href="https://github.com/PouyaFakham/virax-chatroom" target="_blank" rel="noopener" title="سورس و طراحی VIRAX Chatroom"><?php echo htmlspecialchars($site_brand_fa, ENT_QUOTES, 'UTF-8'); ?></a>
             <span class="footer-dot" aria-hidden="true"></span>
             <span class="version-tag" dir="ltr">V <?php echo htmlspecialchars($site_version_label, ENT_QUOTES, 'UTF-8'); ?></span>
             <?php if(!empty($donate_link)): ?>
