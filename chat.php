@@ -1487,7 +1487,10 @@ function veyrax_chat_rev(PDO $pdo, $userId, $room, $targetId) {
             $aiKind = null;
             $aiPeerId = 0;
             $aiCfgNow = veyrax_ai_cfg($pdo);
-            if (($aiCfgNow['ai_enabled'] ?? '0') === '1' && $msgType === 'text' && !$isDemoUser) {
+            // "Enabled" is not the same as "configured". While the endpoint or the
+            // model is still empty nothing is queued, so a question asked during
+            // setup cannot resurface and get answered once the admin finishes.
+            if (veyrax_ai_ready($aiCfgNow) && $msgType === 'text' && !$isDemoUser) {
                 $probe = trim(strip_tags((string)$messageRaw));
                 $aiKeywords = array_values(array_filter(array_map('trim', preg_split('/[,\n]/u', (string)($aiCfgNow['ai_keyword'] ?? '')))));
                 if (!$aiKeywords) $aiKeywords = ['ویراکس'];

@@ -1729,11 +1729,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'ai_model' => $cfg['ai_model'] ?? '',
                 'ai_system_prompt' => $cfg['ai_system_prompt'] ?? '',
                 'ai_behavior' => $cfg['ai_behavior'] ?? '',
-                'ai_max_tokens' => (int)($cfg['ai_max_tokens'] ?: 800),
-                'ai_temperature' => (float)($cfg['ai_temperature'] ?: 0.7),
-                'ai_timeout' => (int)($cfg['ai_timeout'] ?: 60),
-                'ai_cooldown' => (int)($cfg['ai_cooldown'] ?: 5),
-                'ai_max_attempts' => (int)($cfg['ai_max_attempts'] ?: 3),
+                'ai_max_tokens' => (int)(($cfg['ai_max_tokens'] ?? '') ?: 800),
+                'ai_temperature' => (float)(($cfg['ai_temperature'] ?? '') ?: 0.7),
+                'ai_timeout' => (int)(($cfg['ai_timeout'] ?? '') ?: 60),
+                'ai_cooldown' => (int)(($cfg['ai_cooldown'] ?? '') ?: 5),
+                'ai_max_attempts' => (int)(($cfg['ai_max_attempts'] ?? '') ?: 3),
                 'ai_rooms' => $cfg['ai_rooms'] ?? '',
                 'ai_all_rooms' => ($cfg['ai_all_rooms'] ?? '1') === '1',
                 'ai_pv' => ($cfg['ai_pv'] ?? '1') === '1',
@@ -1782,6 +1782,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (isset($_POST['ai_api_key']) && trim($_POST['ai_api_key']) !== '') {
                 $vals['ai_api_key'] = trim($_POST['ai_api_key']);
             }
+
+            // Was the assistant usable before this save? If it was not, and this
+            // save makes it usable, every question still sitting in the queue was
+            // asked while it could not answer. Those are retired instead of being
+            // answered now — a reply to a three-hour-old message is noise.
+            $aiBefore = veyrax_ai_cfg($pdo);
+            $aiWasReady = veyrax_ai_ready($aiBefore);
+
             foreach ($vals as $k => $v) {
                 $chk = $pdo->prepare("SELECT setting_key FROM system_settings WHERE setting_key = ?");
                 $chk->execute([$k]);
@@ -1791,6 +1799,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?)")->execute([$k, $v]);
                 }
             }
+            $aiWillBeReady = ($vals['ai_enabled'] === '1'
+                && $vals['ai_base_url'] !== ''
+                && $vals['ai_model'] !== '');
+            if (!$aiWasReady && $aiWillBeReady) {
+                try {
+                    veyrax_ai_queue_table($pdo);
+                    $pdo->exec("UPDATE ai_queue SET status = 'expired', processed_at = NOW() WHERE status = 'pending'");
+                } catch (Exception $e) {}
+            }
+
             veyrax_ai_user_id($pdo);
             echo json_encode(['status' => 'success', 'message' => 'تنظیمات دستیار ذخیره شد']);
         }

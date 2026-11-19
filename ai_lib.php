@@ -13,7 +13,49 @@ if (!defined('VEYRAX_AI_LIB')) {
             $st = $pdo->query("SELECT setting_key, setting_value FROM system_settings WHERE setting_key LIKE 'ai\\_%'");
             while ($r = $st->fetch(PDO::FETCH_ASSOC)) $cfg[$r['setting_key']] = (string)$r['setting_value'];
         } catch (Exception $e) {}
-        return $cache = $cfg;
+
+        // Every key exists, always. A fresh install has no ai_* rows at all, and
+        // a partially saved config has only the ones the admin touched, so any
+        // call site that read $cfg['ai_x'] without a fallback raised
+        // "Undefined array key" the first time the panel opened. Defaults live
+        // here, once, instead of at each of the twenty call sites.
+        $defaults = [
+            'ai_enabled'            => '0',
+            'ai_base_url'           => '',
+            'ai_api_key'            => '',
+            'ai_model'              => '',
+            'ai_system_prompt'      => '',
+            'ai_behavior'           => '',
+            'ai_max_tokens'         => '800',
+            'ai_temperature'        => '0.7',
+            'ai_timeout'            => '60',
+            'ai_cooldown'           => '5',
+            'ai_max_attempts'       => '3',
+            'ai_rooms'              => '',
+            'ai_all_rooms'          => '1',
+            'ai_pv'                 => '1',
+            'ai_mention_only'       => '1',
+            'ai_user_limit_count'   => '0',
+            'ai_user_limit_window'  => '0',
+            'ai_keyword'            => '',
+        ];
+        return $cache = array_merge($defaults, $cfg);
+    }
+
+    /**
+     * Is the assistant actually able to answer right now?
+     *
+     * "Enabled" alone is not enough: the switch can be on while the endpoint or
+     * the model is still empty, and that is exactly the state a half-configured
+     * install sits in. Treating it as ready queued work that could only fail,
+     * and those failed rows came back to life the moment the admin finished the
+     * setup — the assistant then answered questions asked hours earlier.
+     */
+    function veyrax_ai_ready($cfg) {
+        if (($cfg['ai_enabled'] ?? '0') !== '1') return false;
+        if (trim((string)($cfg['ai_base_url'] ?? '')) === '') return false;
+        if (trim((string)($cfg['ai_model'] ?? '')) === '') return false;
+        return true;
     }
 
     function veyrax_ai_user_id($pdo) {
@@ -398,8 +440,25 @@ if (!defined('VEYRAX_AI_LIB')) {
                 $maxAttempts = max(1, min(5, (int)($cfg['ai_max_attempts'] ?: 3)));
                 $itemBudget = 400;
                 $deadline = microtime(true) + 25.0; // seconds the worker may run
+
+                // A queued question has a shelf life. If the assistant was off,
+                // unreachable or half-configured when it was asked, answering it
+                // twenty minutes later is worse than not answering: the room has
+                // moved on and the reply lands under an unrelated message.
+                // Anything older than AI_QUEUE_TTL is retired unread.
+                $queueTtl = defined('AI_QUEUE_TTL') ? (int)AI_QUEUE_TTL : 300;
+                try {
+                    $pdo->prepare("UPDATE ai_queue SET status = 'expired', processed_at = NOW()
+                                   WHERE status = 'pending' AND created_at < DATE_SUB(NOW(), INTERVAL ? SECOND)")
+                        ->execute([$queueTtl]);
+                } catch (Exception $e) {}
+
                 while ($itemBudget-- > 0) {
-                    $rows = $pdo->query("SELECT * FROM ai_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 25")->fetchAll(PDO::FETCH_ASSOC);
+                    $rows = $pdo->prepare("SELECT * FROM ai_queue
+                                           WHERE status = 'pending' AND created_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
+                                           ORDER BY id ASC LIMIT 25");
+                    $rows->execute([$queueTtl]);
+                    $rows = $rows->fetchAll(PDO::FETCH_ASSOC);
                     if (!$rows) break;
                     foreach ($rows as $row) {
                         $claimed = $pdo->prepare("UPDATE ai_queue SET status = 'processing', attempts = attempts + 1 WHERE id = ? AND status = 'pending'");
@@ -446,7 +505,7 @@ if (!defined('VEYRAX_AI_LIB')) {
                     if (microtime(true) > $deadline) break;
                 }
                 // Housekeeping: the queue is operational data, not history.
-                try { $pdo->exec("DELETE FROM ai_queue WHERE processed_at < DATE_SUB(NOW(), INTERVAL 1 DAY) OR (status IN ('done','failed','limited') AND created_at < DATE_SUB(NOW(), INTERVAL 1 DAY))"); } catch (Exception $e) {}
+                try { $pdo->exec("DELETE FROM ai_queue WHERE processed_at < DATE_SUB(NOW(), INTERVAL 1 DAY) OR (status IN ('done','failed','limited','expired') AND created_at < DATE_SUB(NOW(), INTERVAL 1 DAY))"); } catch (Exception $e) {}
             } finally {
                 try { $pdo->exec("SELECT RELEASE_LOCK('veyrax_ai_queue')"); } catch (Exception $e) {}
             }
